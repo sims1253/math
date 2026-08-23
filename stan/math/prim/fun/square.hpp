@@ -25,7 +25,11 @@ namespace math {
  */
 template <typename T, require_arithmetic_t<T>* = nullptr>
 inline double square(const T x) {
-  return std::pow(x, 2);
+  // Widen to double first so integral and float arguments keep the
+  // promoted-to-double semantics of std::pow(x, 2); the product is the
+  // correctly rounded square, without the libm call.
+  const double x_d = x;
+  return x_d * x_d;
 }
 
 /**
