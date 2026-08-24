@@ -37,6 +37,18 @@ static inline void set_zero_all_adjoints_nested() {
        i < ChainableStack::instance_->var_nochain_stack_.size(); ++i) {
     ChainableStack::instance_->var_nochain_stack_[i]->set_zero_adjoint();
   }
+  // W-53 research slice: nested portion of the batch-registered spans.
+  const size_t span_start
+      = ChainableStack::instance_->nested_var_nochain_span_sizes_.back();
+  for (size_t s = span_start;
+       s < ChainableStack::instance_->var_nochain_spans_.size(); ++s) {
+    const auto &span = ChainableStack::instance_->var_nochain_spans_[s];
+    char *p = reinterpret_cast<char *>(span.begin);
+    for (size_t k = 0; k < span.count; ++k) {
+      reinterpret_cast<vari *>(p)->set_zero_adjoint();
+      p += span.stride;
+    }
+  }
 }
 
 }  // namespace math

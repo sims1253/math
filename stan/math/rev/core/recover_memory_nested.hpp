@@ -35,6 +35,22 @@ static inline void recover_memory_nested() {
       ChainableStack::instance_->nested_var_nochain_stack_sizes_.back());
   ChainableStack::instance_->nested_var_nochain_stack_sizes_.pop_back();
 
+  // W-53 research slice: roll the span registry back to the nested
+  // snapshot (records of the nested region live in the arena region
+  // that memalloc_.recover_nested() frees) and recompute the running
+  // record total over the surviving spans.
+  ChainableStack::instance_->var_nochain_spans_.resize(
+      ChainableStack::instance_->nested_var_nochain_span_sizes_.back());
+  ChainableStack::instance_->nested_var_nochain_span_sizes_.pop_back();
+  {
+    size_t recs = 0;
+    for (const auto &span :
+         ChainableStack::instance_->var_nochain_spans_) {
+      recs += span.count;
+    }
+    ChainableStack::instance_->nochain_span_records_ = recs;
+  }
+
   for (size_t i
        = ChainableStack::instance_->nested_var_alloc_stack_starts_.back();
        i < ChainableStack::instance_->var_alloc_stack_.size(); ++i) {
