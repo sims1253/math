@@ -65,7 +65,8 @@ inline auto multiply(T1&& A, T2&& B) {
 
       reverse_pass_callback(
           [arena_A, arena_B, arena_A_val, arena_B_val, res]() mutable {
-            if constexpr (is_var_matrix<T1>::value || is_var_matrix<T2>::value) {
+            if constexpr (is_var_matrix<T1>::value
+                          || is_var_matrix<T2>::value) {
               arena_A.adj() += res.adj_op() * arena_B_val.transpose();
               arena_B.adj() += arena_A_val.transpose() * res.adj_op();
             } else {

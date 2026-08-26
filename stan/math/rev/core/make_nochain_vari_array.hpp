@@ -4,6 +4,7 @@
 #include <stan/math/prim/fun/Eigen.hpp>
 #include <stan/math/prim/meta.hpp>
 #include <stan/math/rev/core/chainablestack.hpp>
+#include <stan/math/rev/core/var.hpp>
 #include <stan/math/rev/core/vari.hpp>
 #include <new>
 
@@ -29,7 +30,7 @@ namespace math {
  *
  * The returned pointer is the first record; element i is at recs+i.
  * W-59: one pass constructs each record AND fills the caller's output
- * Matrix<var> data pointer (`out[i] = var(recs + i)`) — the fused
+ * Matrix\<var\> data pointer (`out[i] = var(recs + i)`) — the fused
  * loop removes the second pointer-fill pass the call sites used to
  * run separately (rationale + measurements: see WORKLOG W-59).
  */

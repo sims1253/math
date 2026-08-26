@@ -315,7 +315,8 @@ inline auto divide(const Mat1& m1, const Mat2& m2) {
       });
       return ret_type(res);
     } else {
-      arena_t<ret_type> res = (inv_m2.array() * arena_m1.val().array()).matrix();
+      arena_t<ret_type> res
+          = (inv_m2.array() * arena_m1.val().array()).matrix();
       reverse_pass_callback([inv_m2, arena_m1, arena_m2, res]() mutable {
         auto inv_times_res = (inv_m2 * res.adj().array()).eval();
         arena_m1.adj().array() += inv_times_res;
@@ -336,13 +337,15 @@ inline auto divide(const Mat1& m1, const Mat2& m2) {
       arena_t<ret_type> res(quot_expr.rows(), quot_expr.cols());
       make_nochain_vari_array(quot_expr, res.data());
       reverse_pass_callback([inv_m2, arena_m1, arena_m2, res]() mutable {
-        arena_m2.adj().array() -= inv_m2 * res.adj().array() * res.val().array();
+        arena_m2.adj().array() -= inv_m2 * res.adj().array()
+                                     * res.val().array();
       });
       return ret_type(res);
     } else {
       arena_t<ret_type> res = (inv_m2.array() * arena_m1.array()).matrix();
       reverse_pass_callback([inv_m2, arena_m1, arena_m2, res]() mutable {
-        arena_m2.adj().array() -= inv_m2 * res.adj().array() * res.val().array();
+        arena_m2.adj().array() -= inv_m2 * res.adj().array()
+                                     * res.val().array();
       });
       return ret_type(res);
     }
@@ -363,7 +366,8 @@ inline auto divide(const Mat1& m1, const Mat2& m2) {
       });
       return ret_type(res);
     } else {
-      arena_t<ret_type> res = (inv_m2.array() * arena_m1.val().array()).matrix();
+      arena_t<ret_type> res
+          = (inv_m2.array() * arena_m1.val().array()).matrix();
       reverse_pass_callback([inv_m2, arena_m1, arena_m2, res]() mutable {
         arena_m1.adj().array() += inv_m2 * res.adj().array();
       });
