@@ -187,13 +187,52 @@ W46_AVX2_TARGET inline __m256d w46_log1p_poly(__m256d w) {
   return _mm256_fmadd_pd(_mm256_mul_pd(u, u2), S, r);
 }
 
-W46_AVX2_TARGET inline double fwd_avx2(const double* x,
-                                       const double* sg,
-                                       int n, double* p) {
+// ---- W-107 multi-accumulator unroll: W independent 4-lane blocks per
+// group, separate accumulators, W-103 per-block reduction ORDER kept =>
+// bit-identical outputs (proven on the 4 real x sets + 25 remainder
+// sizes; scratch/w107/bench_ilp.cpp). LEAN live set: phase 1 keeps only
+// {px,sg,w,y} per block, nw/gt/lt recomputed in phase 3 (fewer spills).
+// W=3 ships: geomean kernel throughput vs the W-103 island on this Zen3
+// = u2 1.229x / u3 1.394x / u4 1.366x / lean2 1.225x / lean3 1.408x /
+// lean4 1.414x; lean3 picked (wall within noise of lean4, fewest instr
+// per lane: 151 vs 143/block for u1, 154.8 for lean4). ----
+template <int W>
+W46_AVX2_TARGET inline double fwd_avx2_unroll(const double* x,
+                                               const double* sg,
+                                               int n, double* p) {
   const __m256d c20 = _mm256_set1_pd(20.0), nm20 = _mm256_set1_pd(-20.0);
   const __m256d one = _mm256_set1_pd(1.0), zero = _mm256_setzero_pd();
+  const __m256d nsm = _mm256_set1_pd(-0.0);
   double s = 0.0;
   int i = 0;
+  for (; i + 4 * W <= n; i += 4 * W) {
+    __m256d px[W], sgv[W], w[W], y[W], l[W];
+    for (int j = 0; j < W; ++j) {
+      px[j] = _mm256_loadu_pd(x + i + 4 * j);
+      sgv[j] = _mm256_loadu_pd(sg + i + 4 * j);
+      w[j] = w46_exp_negabs(px[j]);
+      y[j] = _mm256_add_pd(w[j], one);
+    }
+    for (int j = 0; j < W; ++j) l[j] = w46_log1p_poly(w[j]);
+    for (int j = 0; j < W; ++j) {
+      const __m256d nw = _mm256_xor_pd(w[j], nsm);
+      const __m256d gt = _mm256_cmp_pd(px[j], c20, _CMP_GT_OQ);
+      const __m256d lt = _mm256_cmp_pd(px[j], nm20, _CMP_LT_OQ);
+      const __m256d vm = _mm256_sub_pd(_mm256_min_pd(px[j], zero), l[j]);
+      const __m256d v = _mm256_blendv_pd(
+          _mm256_blendv_pd(vm, px[j], lt), nw, gt);
+      const __m256d q = _mm256_div_pd(w[j], y[j]);
+      const __m256d pmid = _mm256_mul_pd(
+          sgv[j], _mm256_blendv_pd(q, _mm256_sub_pd(one, q),
+                                   _mm256_cmp_pd(px[j], zero, _CMP_LT_OQ)));
+      const __m256d pv = _mm256_blendv_pd(
+          _mm256_blendv_pd(pmid, sgv[j], lt), nw, gt);
+      _mm256_storeu_pd(p + i + 4 * j, pv);
+      alignas(32) double tmp[4];
+      _mm256_store_pd(tmp, v);
+      s += (tmp[0] + tmp[1]) + (tmp[2] + tmp[3]);
+    }
+  }
   for (; i + 4 <= n; i += 4) {
     const __m256d px = _mm256_loadu_pd(x + i);
     const __m256d sgv = _mm256_loadu_pd(sg + i);
@@ -206,8 +245,6 @@ W46_AVX2_TARGET inline double fwd_avx2(const double* x,
     const __m256d nw = _mm256_xor_pd(w, _mm256_set1_pd(-0.0));
     const __m256d v = _mm256_blendv_pd(
         _mm256_blendv_pd(vm, px, lt), nw, gt);
-    // partials: mid = sg * (x<0 ? 1-q : q), q = w/(1+w);
-    // x<-20 -> sg; x>20 -> -w (stock bug-compat, no sg)
     const __m256d q = _mm256_div_pd(w, y);
     const __m256d pmid = _mm256_mul_pd(
         sgv, _mm256_blendv_pd(q, _mm256_sub_pd(one, q),
@@ -225,6 +262,12 @@ W46_AVX2_TARGET inline double fwd_avx2(const double* x,
     p[i] = pp;
   }
   return s;
+}
+
+W46_AVX2_TARGET inline double fwd_avx2(const double* x,
+                                       const double* sg,
+                                       int n, double* p) {
+  return fwd_avx2_unroll<3>(x, sg, n, p);
 }
 
 inline double dispatch(const double* x, const double* sg, int n, double* p) {
