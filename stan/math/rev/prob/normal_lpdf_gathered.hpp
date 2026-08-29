@@ -116,11 +116,13 @@ template <bool HasConstTerm, bool HasLogSigma, bool HasDS>
 
 /** \ingroup prob_dists
  * Shared core of the gathered normal likelihoods (not part of the public
- * API). W-118 fused interior: ONE vectorizable term traversal produces,
- * per element, the 0-based index, the log-density term, the mu-edge
- * partial (and, when sigma is a var, the sigma-edge partial) and the
- * per-element validity mask carrying stock's `check_range` +
- * `check_not_nan(y)` + `check_finite(mu)` conditions. The per-element op
+ * API). W-118 fused interior: ONE vectorizable term traversal (the
+ * standalone noinline `gathered_term_pass`) produces, per element, the
+ * log-density term, the mu-edge partial (and, when sigma is a var, the
+ * sigma-edge partial) and the per-element validity mask carrying stock's
+ * `check_not_nan(y)` + `check_finite(mu)` conditions (the public
+ * overload's gather pass adds the `check_range` index bits and the
+ * 0-based index store). The per-element op
  * order is EXACTLY that of the SCALAR instantiation
  * `normal_lpdf<propto>(double, var, var)` the stanc-generated loop calls,
  * compiler contraction points included (the `-0.5*z^2 + const` increment
