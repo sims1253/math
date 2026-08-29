@@ -106,6 +106,22 @@ std::vector<var> normal_lpdf_gathered_impl(
   std::vector<var> terms;
   terms.reserve(n_obs);
   for (Eigen::Index k = 0; k < n_obs; ++k) {
+    // Stock's per-element checks, in stock's order: check_not_nan(y)
+    // then check_finite(mu) (the scalar normal_lpdf the generated loop
+    // calls performs both on every element, before computing the term;
+    // sigma is checked once above -- its value is call-constant, so the
+    // throw set is identical, only the mixed sigma<=0-AND-bad-y/mu state
+    // reports Scale instead of Random variable/Location). The scalar
+    // overloads reproduce stock's exact exception type and message: the
+    // scalar lpdf's y_val/mu_val are scalars through
+    // as_value_column_array_or_scalar, so elementwise_check's scalar
+    // branch fires (value printed, no index). THROW-SET parity is part
+    // of the bit-identity contract: on non-finite-mu states the stock
+    // loop throws (the sampler's wrapper then returns logp=-inf with a
+    // ZERO gradient), which a silently-computed NaN/-inf lp with NaN
+    // gradients does not reproduce (W-112.1 mechanism).
+    check_not_nan("normal_lpdf", "Random variable", y_d.coeff(k));
+    check_finite("normal_lpdf", "Location parameter", mu_val.coeff(k));
     const double y_scaled = (y_d.coeff(k) - mu_val.coeff(k)) * inv_sigma_val;
     const double y_scaled_sq = y_scaled * y_scaled;
     double lp_k = -0.5 * y_scaled_sq;
@@ -210,7 +226,9 @@ std::vector<var> normal_lpdf_gathered_impl(
  * @param ii index for each observation (1-based)
  * @param sigma scale parameter (scalar)
  * @return one log-density term (var) per observation
- * @throw std::domain_error if sigma is not positive
+ * @throw std::domain_error if any y[n] is NaN, any mu value is not
+ * finite, or sigma is not positive (per element, in stock's order --
+ * sigma once per call; the throw set matches the stock loop exactly)
  * @throw std::out_of_range if an index is out of range
  */
 template <bool propto, typename T_y, typename T_alpha, typename T_ii,
