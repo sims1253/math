@@ -144,13 +144,14 @@ inline var dot_self_gathered_diff(const T_phi& phi, const T_n1& node1,
     return make_callback_var(
         res.val(), [phi_soa, d_val, n1_arena, n2_arena](const auto& vi) {
           const double s = 2.0 * vi.adj_;
-          // stock order (LIFO): the node2 gather's scatter callback runs
-          // before the node1 gather's
-          for (Eigen::Index e = 0; e < d_val.size(); ++e) {
-            phi_soa->adj_.coeffRef(n2_arena.coeff(e)) -= s * d_val.coeff(e);
-          }
+          // stock order (LIFO): GCC evaluates subtract's arguments
+          // right-to-left, so the node2 gather's reverse callback is
+          // registered FIRST and runs LAST -- the node1 scatter comes first
           for (Eigen::Index e = 0; e < d_val.size(); ++e) {
             phi_soa->adj_.coeffRef(n1_arena.coeff(e)) += s * d_val.coeff(e);
+          }
+          for (Eigen::Index e = 0; e < d_val.size(); ++e) {
+            phi_soa->adj_.coeffRef(n2_arena.coeff(e)) -= s * d_val.coeff(e);
           }
         });
   } else {
