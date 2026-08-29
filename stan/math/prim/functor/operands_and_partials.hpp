@@ -96,6 +96,40 @@ template <typename ViewElt, typename Op>
 constexpr double
     ops_partials_edge<ViewElt, Op, require_st_arithmetic<Op>>::operands_;
 
+/**
+ * Carries an operand together with partials its distribution has already
+ * computed, for passing to `make_partials_propagator()` (or to
+ * `internal::partials_propagator`) in place of the bare operand. The edge
+ * constructed for such an argument initializes its `partials_` member from
+ * the given expression instead of zero-initializing an array that the
+ * distribution then overwrites element by element. This saves one pass over
+ * the partials array; the caller MUST guarantee that the expression assigns
+ * every element of the partials.
+ *
+ * The wrapper only forwards its members to the edge constructor; it does not
+ * extend their lifetime, so the argument must still be alive when the
+ * propagator is constructed (immediate consumption, as in
+ * `make_partials_propagator`).
+ *
+ * @tparam Op type of the operand
+ * @tparam Partials type of the (Eigen expression for the) partials
+ */
+template <typename Op, typename Partials>
+struct operand_with_partials {
+  const Op& operand;
+  const Partials& partials;
+};
+
+/**
+ * Constructs an `operand_with_partials` for a distribution that fully
+ * overwrites the edge partials of `op` with `partials`.
+ */
+template <typename Op, typename Partials>
+inline operand_with_partials<std::decay_t<Op>, std::decay_t<Partials>>
+make_operand_with_partials(const Op& op, const Partials& partials) {
+  return {op, partials};
+}
+
 }  // namespace internal
 
 /** \ingroup type_trait

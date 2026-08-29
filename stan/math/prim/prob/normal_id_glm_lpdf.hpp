@@ -120,7 +120,10 @@ inline return_type_t<T_y, T_x, T_alpha, T_beta, T_scale> normal_id_glm_lpdf(
   // the most efficient way to calculate this depends on template parameters
   T_partials_return y_scaled_sq_sum;
 
-  Array<T_partials_return, Dynamic, 1> y_scaled(N_instances);
+  // left unsized so that the assignments below size and fill it directly:
+  // a sized constructor would zero-initialize storage that these
+  // assignments then overwrite in full
+  Array<T_partials_return, Dynamic, 1> y_scaled;
   if constexpr (T_x_rows == 1) {
     T_y_scaled_tmp y_scaled_tmp = (x_val * beta_val_vec).coeff(0, 0);
     y_scaled = (as_array_or_scalar(y_val_vec) - y_scaled_tmp
@@ -133,11 +136,49 @@ inline return_type_t<T_y, T_x, T_alpha, T_beta, T_scale> normal_id_glm_lpdf(
                * inv_sigma;
   }
 
-  auto ops_partials
-      = make_partials_propagator(y_ref, x_ref, alpha_ref, beta_ref, sigma_ref);
+  // For a reverse-mode vector alpha the alpha-edge partials are exactly
+  // mu_derivative, so mu_derivative is computed first and seeded into the
+  // edge at construction (operand_with_partials) instead of letting the edge
+  // zero-initialize its partials array and overwriting every element of it
+  // below. Saves one pass over the array; no arithmetic changes.
+  using T_alpha_plain = plain_type_t<std::decay_t<T_alpha_ref>>;
+  constexpr bool alpha_seeded
+      = is_var_v<return_type_t<T_y_ref, T_x_ref, T_alpha_ref, T_beta_ref,
+                               T_sigma_ref>>
+        && is_eigen_v<T_alpha_plain>
+        && has_var_scalar_type<T_alpha_plain>::value
+        && is_vector<T_alpha>::value;
+  using ops_partials_t = internal::partials_propagator<
+      return_type_t<T_y_ref, T_x_ref, T_alpha_ref, T_beta_ref, T_sigma_ref>,
+      void, plain_type_t<std::decay_t<T_y_ref>>,
+      plain_type_t<std::decay_t<T_x_ref>>,
+      std::conditional_t<
+          alpha_seeded,
+          internal::operand_with_partials<
+              T_alpha_plain, Matrix<T_partials_return, Dynamic, 1>>,
+          T_alpha_plain>,
+      plain_type_t<std::decay_t<T_beta_ref>>,
+      plain_type_t<std::decay_t<T_sigma_ref>>>;
+  [[maybe_unused]] Matrix<T_partials_return, Dynamic, 1> mu_derivative;
+  auto ops_partials = [&]() {
+    if constexpr (alpha_seeded) {
+      mu_derivative = inv_sigma * y_scaled;
+      return ops_partials_t(
+          y_ref, x_ref,
+          internal::operand_with_partials<
+              T_alpha_plain, Matrix<T_partials_return, Dynamic, 1>>{
+              alpha_ref, mu_derivative},
+          beta_ref, sigma_ref);
+    } else {
+      return make_partials_propagator(y_ref, x_ref, alpha_ref, beta_ref,
+                                      sigma_ref);
+    }
+  }();
 
   if constexpr (!(is_constant_all<T_y, T_x, T_beta, T_alpha, T_scale>::value)) {
-    Matrix<T_partials_return, Dynamic, 1> mu_derivative = inv_sigma * y_scaled;
+    if constexpr (!alpha_seeded) {
+      mu_derivative = inv_sigma * y_scaled;
+    }
     if constexpr (is_autodiff_v<T_y>) {
       if constexpr (is_vector<T_y>::value) {
         partials<0>(ops_partials) = -mu_derivative;
@@ -161,10 +202,14 @@ inline return_type_t<T_y, T_x, T_alpha, T_beta, T_scale> normal_id_glm_lpdf(
       }
     }
     if constexpr (is_autodiff_v<T_alpha>) {
-      if constexpr (is_vector<T_alpha>::value) {
-        partials<2>(ops_partials) = mu_derivative;
-      } else {
-        partials<2>(ops_partials)[0] = sum(mu_derivative);
+      // a reverse-mode vector alpha's partials were seeded into its edge at
+      // propagator construction
+      if constexpr (!alpha_seeded) {
+        if constexpr (is_vector<T_alpha>::value) {
+          partials<2>(ops_partials) = mu_derivative;
+        } else {
+          partials<2>(ops_partials)[0] = sum(mu_derivative);
+        }
       }
     }
     if constexpr (is_autodiff_v<T_scale>) {
