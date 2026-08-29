@@ -1,6 +1,7 @@
 #include <stan/math/rev.hpp>
 #include <stan/math/prim.hpp>
 #include <test/unit/math/rev/util.hpp>
+#include <test/unit/util.hpp>
 #include <gtest/gtest.h>
 #include <vector>
 #include <cmath>
@@ -588,7 +589,7 @@ TEST_F(AgradRev, poisson_glm_throw_set_parity_w122) {
     EXPECT_THROW_MSG(
         stan::math::poisson_log_glm_lpmf(ybad, x, alpha, beta),
         std::domain_error,
-        "poisson_log_glm_lpmf: Vector of dependent variables[2] is -5, "
+        "poisson_log_glm_lpmf: Vector of dependent variables[3] is -5, "
         "but must be nonnegative!");
   }
   {  // non-finite beta: deferred class (full forward compute, then the
@@ -597,13 +598,13 @@ TEST_F(AgradRev, poisson_glm_throw_set_parity_w122) {
     binf << 0.3, std::numeric_limits<double>::infinity();
     EXPECT_THROW_MSG(stan::math::poisson_log_glm_lpmf(y, x, alpha, binf),
                      std::domain_error,
-                     "poisson_log_glm_lpmf: Weight vector[1] is inf, "
+                     "poisson_log_glm_lpmf: Weight vector[2] is inf, "
                      "but must be finite!");
     Matrix<var, Dynamic, 1> bnan(2, 1);
     bnan << std::numeric_limits<double>::quiet_NaN(), 2;
     EXPECT_THROW_MSG(stan::math::poisson_log_glm_lpmf(y, x, alpha, bnan),
                      std::domain_error,
-                     "poisson_log_glm_lpmf: Weight vector[0] is nan, "
+                     "poisson_log_glm_lpmf: Weight vector[1] is nan, "
                      "but must be finite!");
   }
   {  // non-finite scalar alpha: deferred class, fires after the beta check
@@ -619,7 +620,7 @@ TEST_F(AgradRev, poisson_glm_throw_set_parity_w122) {
     xinf(3, 0) = std::numeric_limits<double>::infinity();
     EXPECT_THROW_MSG(stan::math::poisson_log_glm_lpmf(y, xinf, alpha, beta),
                      std::domain_error,
-                     "poisson_log_glm_lpmf: Matrix of independent variables[3]"
+                     "poisson_log_glm_lpmf: Matrix of independent variables[4]"
                      " is inf, but must be finite!");
   }
 }
@@ -661,7 +662,7 @@ TEST_F(AgradRev, poisson_glm_fused_interior_paths_w122) {
     var lp = stan::math::poisson_log_glm_lpmf(y, x, alpha, beta);
     lp.grad();
     EXPECT_TRUE(std::isfinite(lp.val()));
-    EXPECT_FLOAT_EQ(2.0, alpha.adj());  // y - e^theta = y - 0
+    EXPECT_FLOAT_EQ(5.0, alpha.adj());  // sum(y) - sum(e^theta) = 5 - 0
     stan::math::recover_memory();
   }
   // row-vector x (T_x_rows == 1) + repeated gradient evaluation
@@ -675,10 +676,12 @@ TEST_F(AgradRev, poisson_glm_fused_interior_paths_w122) {
     var lp = stan::math::poisson_log_glm_lpmf(y, x, alpha, beta);
     lp.grad();
     double a1 = alpha.adj(), b1 = beta(0).adj();
+    stan::math::set_zero_all_adjoints();
     var lp2 = stan::math::poisson_log_glm_lpmf(y, x, alpha, beta);
     lp2.grad();
-    EXPECT_FLOAT_EQ(a1, alpha.adj() - a1);  // second eval adds the same adj
-    EXPECT_FLOAT_EQ(b1, beta(0).adj() - b1);
+    // re-evaluation on the same operands reproduces the same adjoints
+    EXPECT_FLOAT_EQ(a1, alpha.adj());
+    EXPECT_FLOAT_EQ(b1, beta(0).adj());
     stan::math::recover_memory();
   }
 }
