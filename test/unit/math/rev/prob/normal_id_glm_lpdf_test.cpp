@@ -766,3 +766,105 @@ TEST_F(AgradRev, ProbDistributionsNormalIdGLM_glm_type_issue_3189) {
   EXPECT_FLOAT_EQ(stan::math::normal_id_glm_lpdf<false>(y, x, 0, beta, 1).val(),
                   -27.701815);
 }
+
+// W-120 (glm-edge-cleanup): a reverse-mode VECTOR alpha seeds its edge
+// partials at construction (internal::operand_with_partials) instead of the
+// edge zero-initializing its array and every element being overwritten
+// afterwards. The gradient of that path must match the composition with
+// plain primitives, for an lvalue alpha, a temporary (rvalue) alpha
+// expression, and the broadcast-x shape.
+TEST_F(AgradRev, ProbDistributionsNormalIdGLM_vec_alpha_seeded_edge) {
+  using Eigen::Dynamic;
+  using Eigen::Matrix;
+  using stan::math::var;
+  Eigen::VectorXd y_val(4), alpha_val(4), beta_val(2);
+  y_val << 14, 32, 21, 5;
+  alpha_val << 0.3, -1.2, 0.7, 2.0;
+  beta_val << 0.3, 2;
+  Eigen::MatrixXd x_val(4, 2);
+  x_val << -12, 46, -42, 24, 25, 27, 3, -8;
+
+  // reference pass: composed vectorized normal on theta = x * beta + alpha
+  Matrix<var, Dynamic, 1> y = y_val, alpha = alpha_val, beta = beta_val;
+  Matrix<var, Dynamic, Dynamic> x = x_val;
+  var sigma = 10;
+  Matrix<var, Dynamic, 1> theta = x * beta + alpha;
+  var lp_ref = stan::math::normal_lpdf(y, theta, sigma);
+  lp_ref.grad();
+  Eigen::VectorXd ref_alpha_adj = alpha.adj(), ref_beta_adj = beta.adj();
+  double ref_lp = lp_ref.val(), ref_sigma_adj = sigma.adj();
+  stan::math::recover_memory();
+  // second reference at the doubled alpha point (for the rvalue arm below)
+  Eigen::VectorXd ref2_alpha_adj(4);
+  double ref2_lp;
+  {
+    Matrix<var, Dynamic, 1> y3 = y_val, alpha3 = alpha_val, beta3 = beta_val;
+    Matrix<var, Dynamic, Dynamic> x3 = x_val;
+    var sigma3 = 10;
+    Matrix<var, Dynamic, 1> theta3 = x3 * beta3 + (alpha3 + alpha3);
+    var lp2 = stan::math::normal_lpdf(y3, theta3, sigma3);
+    lp2.grad();
+    ref2_alpha_adj = alpha3.adj();
+    ref2_lp = lp2.val();
+  }
+  stan::math::recover_memory();
+
+  // seeded path, lvalue vector alpha
+  {
+    Matrix<var, Dynamic, 1> y2 = y_val, alpha2 = alpha_val, beta2 = beta_val;
+    Matrix<var, Dynamic, Dynamic> x2 = x_val;
+    var sigma2 = 10;
+    var lp = stan::math::normal_id_glm_lpdf<false>(y2, x2, alpha2, beta2,
+                                                   sigma2);
+    lp.grad();
+    EXPECT_FLOAT_EQ(ref_lp, lp.val());
+    EXPECT_FLOAT_EQ(ref_sigma_adj, sigma2.adj());
+    for (int i = 0; i < 4; ++i) {
+      EXPECT_FLOAT_EQ(ref_alpha_adj[i], alpha2[i].adj());
+    }
+    for (int i = 0; i < 2; ++i) {
+      EXPECT_FLOAT_EQ(ref_beta_adj[i], beta2[i].adj());
+    }
+  }
+  stan::math::recover_memory();
+
+  // seeded path, temporary (rvalue) alpha expression: the edge must keep its
+  // own copy of the operand, so the gradient must survive the temporary
+  {
+    Matrix<var, Dynamic, 1> y2 = y_val, alpha2 = alpha_val, beta2 = beta_val;
+    Matrix<var, Dynamic, Dynamic> x2 = x_val;
+    var sigma2 = 10;
+    var lp = stan::math::normal_id_glm_lpdf<false>(y2, x2, alpha2 + alpha2,
+                                                   beta2, sigma2);
+    lp.grad();
+    EXPECT_FLOAT_EQ(ref2_lp, lp.val());
+    for (int i = 0; i < 4; ++i) {
+      EXPECT_FLOAT_EQ(ref2_alpha_adj[i], alpha2[i].adj());
+    }
+  }
+}
+
+TEST_F(AgradRev, ProbDistributionsNormalIdGLM_vec_alpha_seeded_edge_rowvec_x) {
+  // T_x_rows == 1 (broadcast x) with a vector alpha: same seeded class
+  using Eigen::Dynamic;
+  using Eigen::Matrix;
+  using stan::math::var;
+  Matrix<double, 1, Dynamic> xr(1, 2);
+  xr << 0.7, -0.8;
+  Eigen::VectorXd y_val(3), alpha_val(3), beta_val(2);
+  y_val << 1.5, -2.0, 0.25;
+  alpha_val << 0.3, -1.2, 0.7;
+  beta_val << 0.5, -0.25;
+
+  Matrix<var, Dynamic, 1> y = y_val, alpha = alpha_val, beta = beta_val;
+  var sigma(1.5);
+  var lp = stan::math::normal_id_glm_lpdf<false>(y, xr, alpha, beta, sigma);
+  lp.grad();
+  // analytic: d/d alpha_i = (y_i - mu_i) / sigma^2, mu_i = alpha_i + x . beta
+  const double s2 = 1.5 * 1.5;
+  const double mu_off = 0.7 * 0.5 + 0.8 * 0.25;
+  for (int i = 0; i < 3; ++i) {
+    double expected = (y_val[i] - (alpha_val[i] + mu_off)) / s2;
+    EXPECT_NEAR(expected, alpha[i].adj(), 1e-12);
+  }
+}

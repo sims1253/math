@@ -120,10 +120,7 @@ inline return_type_t<T_y, T_x, T_alpha, T_beta, T_scale> normal_id_glm_lpdf(
   // the most efficient way to calculate this depends on template parameters
   T_partials_return y_scaled_sq_sum;
 
-  // left unsized so that the assignments below size and fill it directly:
-  // a sized constructor would zero-initialize storage that these
-  // assignments then overwrite in full
-  Array<T_partials_return, Dynamic, 1> y_scaled;
+  Array<T_partials_return, Dynamic, 1> y_scaled(N_instances);
   if constexpr (T_x_rows == 1) {
     T_y_scaled_tmp y_scaled_tmp = (x_val * beta_val_vec).coeff(0, 0);
     y_scaled = (as_array_or_scalar(y_val_vec) - y_scaled_tmp
