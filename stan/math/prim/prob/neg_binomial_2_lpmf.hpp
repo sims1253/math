@@ -16,6 +16,7 @@
 #include <stan/math/prim/functor/partials_propagator.hpp>
 #include <cmath>
 
+
 namespace stan {
 namespace math {
 
@@ -125,16 +126,25 @@ inline return_type_t<T_location, T_precision> neg_binomial_2_lpmf(
     const T_partials_return log_mu_plus_phi = log(mu_plus_phi);
     const T_partials_return n_plus_phi = n_d + phi_v;
     if constexpr (include_precision || include_location) {
-      // logp_calc(), with the (-phi)*log1p product in its own statement so
-      // that the only FMA-fusable product at -mfma levels is n*log(mu+phi)
-      // — the product stock's compiled expression fuses (vfnmadd231sd:
-      // fl(fl(-phi*log1p) - (n*lmp)_exact), verified in stock disassembly
-      // of both the worktree and bundle environments; at -O2 the shape is
-      // mulsd+mulsd+subsd in both).
+      // logp_calc(): the subtract's fused product is pinned explicitly.
+      // Stock's compiled expression evaluates fl(fl(-phi*log1p(mu/phi)) -
+      // (n*lmp)_exact) — the n*lmp product is the FMA-fused one
+      // (vfnmadd231sd, disassembly-verified in both the worktree and the
+      // bundle environments at -mfma levels; mulsd+mulsd+subsd at -O2).
+      // Writing the same expression in plain C++ leaves GCC free to fuse
+      // EITHER product (TU-scheduling dependent — observed fusing
+      // phi*log1p instead, differing in ~21% of elements by 1 ULP), so
+      // the stock form is pinned: one explicit std::fma (the same
+      // instruction) when FMA is enabled, the unfused shape otherwise.
       const T_partials_return neg_phi_log1p
           = -phi_v * log1p(mu_v / phi_v);
+#ifdef __FMA__
+      const T_partials_return calc
+          = std::fma(-n_d, log_mu_plus_phi, neg_phi_log1p);
+#else
       const T_partials_return calc
           = neg_phi_log1p - n_d * log_mu_plus_phi;
+#endif
       T_partials_return term = 0;
       if constexpr (include_precision && include_location) {
         term = binomial_coefficient_log(n_plus_phi - 1.0, n_o)
