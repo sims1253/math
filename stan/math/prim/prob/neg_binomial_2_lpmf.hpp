@@ -19,6 +19,94 @@
 
 namespace stan {
 namespace math {
+namespace internal {
+
+// Fused per-element worker for neg_binomial_2_lpmf (W-123 restructure):
+// evaluates one element's logp term, location partial, and precision
+// partial in stock's per-element order. always_inline: the pass loop must
+// not pay a per-element call (GCC otherwise outlines a capturing lambda).
+// phi_scalar = phi_val is an arithmetic scalar (broadcast); then log_phi
+// is the precomputed scalar log(phi) and digamma_phi_scalar the one
+// per-call digamma(phi).
+template <bool include_precision, bool include_location, bool mu_autodiff,
+          bool phi_autodiff, bool phi_scalar, typename TN, typename TMU,
+          typename TPHI, typename TLOGPHI>
+__attribute__((always_inline)) inline double nb2_element_work(
+    Eigen::Index i, const TN& n_val, const TMU& mu_val, const TPHI& phi_val,
+    const TLOGPHI& log_phi, double digamma_phi_scalar, double& p_mu_i,
+    double& p_phi_i) {
+  auto at = [](const auto& x, Eigen::Index k) {
+    using X = std::decay_t<decltype(x)>;
+    if constexpr (std::is_arithmetic_v<X>) {
+      return x;
+    } else {
+      return x[k];
+    }
+  };
+  const auto n_o = at(n_val, i);
+  const double n_d = static_cast<double>(n_o);
+  const double mu_v = at(mu_val, i);
+  const double phi_v = at(phi_val, i);
+  const double mu_plus_phi = mu_v + phi_v;
+  const double log_mu_plus_phi = log(mu_plus_phi);
+  const double n_plus_phi = n_d + phi_v;
+  if constexpr (include_precision || include_location) {
+    // logp_calc(): the subtract's fused product is pinned explicitly.
+    // Stock's compiled expression evaluates fl(fl(-phi*log1p(mu/phi)) -
+    // (n*lmp)_exact) — the n*lmp product is the FMA-fused one
+    // (vfnmadd231sd, disassembly-verified in both the worktree and the
+    // bundle environments at -mfma levels; mulsd+mulsd+subsd at -O2).
+    // Writing the same expression in plain C++ leaves GCC free to fuse
+    // EITHER product (TU-scheduling dependent — observed fusing
+    // phi*log1p instead, differing in ~21% of elements by 1 ULP), so
+    // the stock form is pinned: one explicit std::fma (the same
+    // instruction) when FMA is enabled, the unfused shape otherwise.
+    const double neg_phi_log1p = -phi_v * log1p(mu_v / phi_v);
+#ifdef __FMA__
+    const double calc = std::fma(-n_d, log_mu_plus_phi, neg_phi_log1p);
+#else
+    const double calc = neg_phi_log1p - n_d * log_mu_plus_phi;
+#endif
+    double term = 0;
+    if constexpr (include_precision && include_location) {
+      term = binomial_coefficient_log(n_plus_phi - 1.0, n_o)
+             + multiply_log(n_o, mu_v) + calc;
+    } else if constexpr (include_precision) {
+      term = binomial_coefficient_log(n_plus_phi - 1.0, n_o) + calc;
+    } else {
+      term = multiply_log(n_o, mu_v) + calc;
+    }
+    if constexpr (mu_autodiff) {
+      p_mu_i = n_d / mu_v - n_plus_phi / mu_plus_phi;
+    }
+    if constexpr (phi_autodiff) {
+      const double digamma_n_plus_phi = digamma(n_plus_phi);
+      double log_term;
+      if (mu_v < phi_v) {
+        log_term = log1p(-mu_v / mu_plus_phi);
+      } else {
+        if constexpr (phi_scalar) {
+          log_term = log_phi - log_mu_plus_phi;
+        } else {
+          log_term = log_phi[i] - log_mu_plus_phi;
+        }
+      }
+      double digamma_phi;
+      if constexpr (phi_scalar) {
+        digamma_phi = digamma_phi_scalar;
+      } else {
+        digamma_phi = digamma(at(phi_val, i));
+      }
+      p_phi_i = (mu_v - n_d) / mu_plus_phi + log_term - digamma_phi
+                + digamma_n_plus_phi;
+    }
+    return term;
+  } else {
+    return 0;
+  }
+}
+
+}  // namespace internal
 
 // NegBinomial(n|mu, phi)  [mu >= 0; phi > 0;  n >= 0]
 //
@@ -76,102 +164,26 @@ inline return_type_t<T_location, T_precision> neg_binomial_2_lpmf(
   constexpr bool include_precision
       = include_summand<propto, T_precision>::value;
   constexpr bool include_location = include_summand<propto, T_location>::value;
+  constexpr bool phi_is_scalar
+      = std::is_arithmetic_v<std::decay_t<decltype(phi_val)>>;
   // digamma(phi) for a scalar phi is one call per lpmf evaluation (stock
   // evaluates it once at the precision-partials statement); a vector phi
-  // evaluates it per element inside the pass below, as stock's lazy
-  // expression node did.
-  T_partials_return digamma_phi_scalar = 0.0;
-  if constexpr (is_autodiff_v<T_precision>
-                && std::is_arithmetic_v<std::decay_t<decltype(phi_val)>>) {
+  // evaluates it per element inside the pass, as stock's lazy expression
+  // node did.
+  double digamma_phi_scalar = 0.0;
+  if constexpr (is_autodiff_v<T_precision> && phi_is_scalar) {
     digamma_phi_scalar = digamma(phi_val);
   }
-  // element accessor: Eigen containers index, arithmetic scalars broadcast
-  auto elem = [](const auto& x, Eigen::Index i) {
-    using X = std::decay_t<decltype(x)>;
-    if constexpr (std::is_arithmetic_v<X>) {
-      return x;
-    } else {
-      return x[i];
-    }
-  };
-  auto log_phi_at = [&](Eigen::Index i) -> T_partials_return {
-    if constexpr (std::is_arithmetic_v<std::decay_t<decltype(log_phi)>>) {
-      return log_phi;
-    } else {
-      return static_cast<T_partials_return>(log_phi[i]);
-    }
-  };
-  auto digamma_phi_at = [&](Eigen::Index i) -> T_partials_return {
-    if constexpr (std::is_arithmetic_v<std::decay_t<decltype(phi_val)>>) {
-      return digamma_phi_scalar;
-    } else {
-      return digamma(elem(phi_val, i));
-    }
-  };
 
   T_partials_return p_mu_i = 0.0;
   T_partials_return p_phi_i = 0.0;
-  // One fused scalar-sequential pass. Per element this evaluates, in stock
-  // order: the logp term (binomial_coefficient_log(n+phi-1, n) +
-  // multiply_log(n, mu) + (-phi)*log1p(mu/phi) - n*log(mu+phi)), then the
-  // location partial (n/mu - (n+phi)/(mu+phi)), then the precision partial
-  // ((mu-n)/(mu+phi) + select(mu<phi, log1p(-mu/(mu+phi)), log(phi) -
-  // log(mu+phi)) - digamma(phi) + digamma(n+phi)).
   auto element_work = [&](Eigen::Index i) -> T_partials_return {
-    const auto n_o = elem(n_val, i);
-    const T_partials_return n_d = static_cast<T_partials_return>(n_o);
-    const T_partials_return mu_v = elem(mu_val, i);
-    const T_partials_return phi_v = elem(phi_val, i);
-    const T_partials_return mu_plus_phi = mu_v + phi_v;
-    const T_partials_return log_mu_plus_phi = log(mu_plus_phi);
-    const T_partials_return n_plus_phi = n_d + phi_v;
-    if constexpr (include_precision || include_location) {
-      // logp_calc(): the subtract's fused product is pinned explicitly.
-      // Stock's compiled expression evaluates fl(fl(-phi*log1p(mu/phi)) -
-      // (n*lmp)_exact) — the n*lmp product is the FMA-fused one
-      // (vfnmadd231sd, disassembly-verified in both the worktree and the
-      // bundle environments at -mfma levels; mulsd+mulsd+subsd at -O2).
-      // Writing the same expression in plain C++ leaves GCC free to fuse
-      // EITHER product (TU-scheduling dependent — observed fusing
-      // phi*log1p instead, differing in ~21% of elements by 1 ULP), so
-      // the stock form is pinned: one explicit std::fma (the same
-      // instruction) when FMA is enabled, the unfused shape otherwise.
-      const T_partials_return neg_phi_log1p
-          = -phi_v * log1p(mu_v / phi_v);
-#ifdef __FMA__
-      const T_partials_return calc
-          = std::fma(-n_d, log_mu_plus_phi, neg_phi_log1p);
-#else
-      const T_partials_return calc
-          = neg_phi_log1p - n_d * log_mu_plus_phi;
-#endif
-      T_partials_return term = 0;
-      if constexpr (include_precision && include_location) {
-        term = binomial_coefficient_log(n_plus_phi - 1.0, n_o)
-               + multiply_log(n_o, mu_v) + calc;
-      } else if constexpr (include_precision) {
-        term = binomial_coefficient_log(n_plus_phi - 1.0, n_o) + calc;
-      } else {
-        term = multiply_log(n_o, mu_v) + calc;
-      }
-      if constexpr (is_autodiff_v<T_location>) {
-        p_mu_i = n_d / mu_v - n_plus_phi / mu_plus_phi;
-      }
-      if constexpr (is_autodiff_v<T_precision>) {
-        const T_partials_return digamma_n_plus_phi = digamma(n_plus_phi);
-        T_partials_return log_term;
-        if (mu_v < phi_v) {
-          log_term = log1p(-mu_v / mu_plus_phi);
-        } else {
-          log_term = log_phi_at(i) - log_mu_plus_phi;
-        }
-        p_phi_i = (mu_v - n_d) / mu_plus_phi + log_term
-                  - digamma_phi_at(i) + digamma_n_plus_phi;
-      }
-      return term;
-    } else {
-      return 0;
-    }
+    return internal::nb2_element_work<include_precision, include_location,
+                                      is_autodiff_v<T_location>,
+                                      is_autodiff_v<T_precision>,
+                                      phi_is_scalar>(
+        i, n_val, mu_val, phi_val, log_phi, digamma_phi_scalar, p_mu_i,
+        p_phi_i);
   };
 
   const Eigen::Index size = max_size(n_ref, mu_ref, phi_ref);
