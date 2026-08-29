@@ -107,22 +107,85 @@ inline return_type_t<T_x, T_alpha, T_beta> poisson_log_glm_lpmf(
     theta += as_array_or_scalar(alpha_val_vec);
   }
 
-  Matrix<T_partials_return, Dynamic, 1> theta_derivative
-      = as_array_or_scalar(y_val_vec) - exp(theta.array());
-  T_partials_return theta_derivative_sum = sum(theta_derivative);
-  if (!isfinite(theta_derivative_sum)) {
-    check_finite(function, "Weight vector", beta);
-    check_finite(function, "Intercept", alpha);
-    check_finite(function, "Matrix of independent variables", theta);
-  }
-
+  // exp(theta) is a deterministic function of theta, and for every y whose
+  // (post-value_of) element type differs from double the two stock
+  // evaluation sites below are mixed-scalar-type Eigen expressions, which
+  // Eigen evaluates with scalar (DefaultTraversal) passes calling std::exp
+  // per element -- so both sites produce identical per-element values and
+  // the second evaluation is fused away. The derivative pass, the constant
+  // lgamma pass, and the log-probability term pass then run as ONE
+  // scalar-sequential loop whose per-element operation order and fold
+  // orders (left fold starting at element 0, matching Eigen's
+  // DefaultTraversal redux; contraction points verified by disassembly at
+  // -O3 -mavx2 -mfma and -O2) reproduce the stock statements exactly.
+  // A double-typed y instead makes both stock sites pure-double Eigen
+  // expressions that Eigen evaluates with packet traversals (vectorized
+  // pexp bodies with per-site glibc scalar tails), for which a shared
+  // recompute is not provably value-identical -- that class keeps the
+  // stock interior unchanged.
+  Matrix<T_partials_return, Dynamic, 1> theta_derivative(N_instances);
+  T_partials_return theta_derivative_sum(0);
   T_partials_return logp(0);
-  if constexpr (include_summand<propto>::value) {
-    logp -= sum(lgamma(as_array_or_scalar(y_val_vec) + 1));
-  }
+  if constexpr (std::is_same<scalar_type_t<std::decay_t<decltype(y_val_vec)>>,
+                             double>::value) {
+    theta_derivative = as_array_or_scalar(y_val_vec) - exp(theta.array());
+    theta_derivative_sum = sum(theta_derivative);
+    if (!isfinite(theta_derivative_sum)) {
+      check_finite(function, "Weight vector", beta);
+      check_finite(function, "Intercept", alpha);
+      check_finite(function, "Matrix of independent variables", theta);
+    }
 
-  logp += sum(as_array_or_scalar(y_val_vec) * theta.array()
-              - exp(theta.array()));
+    if constexpr (include_summand<propto>::value) {
+      logp -= sum(lgamma(as_array_or_scalar(y_val_vec) + 1));
+    }
+
+    logp += sum(as_array_or_scalar(y_val_vec) * theta.array()
+                - exp(theta.array()));
+  } else {
+    const auto& y_arr = as_array_or_scalar(y_val_vec);
+    auto y_at = [&y_arr](Eigen::Index i) {
+      if constexpr (std::is_arithmetic<
+                        std::remove_reference_t<decltype(y_arr)>>::value) {
+        (void)i;
+        return y_arr;
+      } else {
+        return y_arr.coeff(i);
+      }
+    };
+    const T_partials_return* th = theta.data();
+    T_partials_return* td = theta_derivative.data();
+    T_partials_return terms_sum(0);
+    T_partials_return lgamma_sum(0);
+    {
+      const T_partials_return e0 = exp(th[0]);
+      td[0] = y_at(0) - e0;
+      terms_sum = th[0] * y_at(0) - e0;
+      if constexpr (include_summand<propto>::value) {
+        lgamma_sum = lgamma(y_at(0) + 1);
+      }
+    }
+    for (Eigen::Index i = 1; i < static_cast<Eigen::Index>(N_instances);
+         ++i) {
+      const T_partials_return e_i = exp(th[i]);
+      td[i] = y_at(i) - e_i;
+      terms_sum += th[i] * y_at(i) - e_i;
+      if constexpr (include_summand<propto>::value) {
+        lgamma_sum += lgamma(y_at(i) + 1);
+      }
+    }
+    theta_derivative_sum = sum(theta_derivative);
+    if (!isfinite(theta_derivative_sum)) {
+      check_finite(function, "Weight vector", beta);
+      check_finite(function, "Intercept", alpha);
+      check_finite(function, "Matrix of independent variables", theta);
+    }
+
+    if constexpr (include_summand<propto>::value) {
+      logp -= lgamma_sum;
+    }
+    logp += terms_sum;
+  }
 
   auto ops_partials = make_partials_propagator(x_ref, alpha_ref, beta_ref);
   // Compute the necessary derivatives.
