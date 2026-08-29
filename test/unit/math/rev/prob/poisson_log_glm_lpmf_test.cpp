@@ -564,3 +564,121 @@ TEST_F(AgradRev,
   double lp1_val = lp1.val();
   EXPECT_FLOAT_EQ(lp_val, lp1_val);
 }
+
+// ---------------------------------------------------------------------------
+// W-122 fused interior: throw-set parity (stock's exact exception classes,
+// messages, and first-failing indices for the deferred/NaN classes) plus
+// fused-path numeric coverage (all-zero y, deep-underflow theta, vector
+// alpha, row-vector x, repeated gradient evaluation).
+// ---------------------------------------------------------------------------
+TEST_F(AgradRev, poisson_glm_throw_set_parity_w122) {
+  using Eigen::Dynamic;
+  using Eigen::Matrix;
+  using stan::math::var;
+  using std::vector;
+  vector<int> y{15, 3, 5, 0, 7};
+  Matrix<double, Dynamic, Dynamic> x(5, 2);
+  x << -12, 46, -42, 24, 25, 27, -1, 2, 3, -4;
+  var alpha = 0.3;
+  Matrix<var, Dynamic, 1> beta(2, 1);
+  beta << 0.3, 2;
+
+  {  // negative y fires the upfront nonnegative scan at the first bad index
+    vector<int> ybad{15, 3, -5, 0, 7};
+    EXPECT_THROW_MSG(
+        stan::math::poisson_log_glm_lpmf(ybad, x, alpha, beta),
+        std::domain_error,
+        "poisson_log_glm_lpmf: Vector of dependent variables[2] is -5, "
+        "but must be nonnegative!");
+  }
+  {  // non-finite beta: deferred class (full forward compute, then the
+     // weight-vector check fires first, at the bad index)
+    Matrix<var, Dynamic, 1> binf(2, 1);
+    binf << 0.3, std::numeric_limits<double>::infinity();
+    EXPECT_THROW_MSG(stan::math::poisson_log_glm_lpmf(y, x, alpha, binf),
+                     std::domain_error,
+                     "poisson_log_glm_lpmf: Weight vector[1] is inf, "
+                     "but must be finite!");
+    Matrix<var, Dynamic, 1> bnan(2, 1);
+    bnan << std::numeric_limits<double>::quiet_NaN(), 2;
+    EXPECT_THROW_MSG(stan::math::poisson_log_glm_lpmf(y, x, alpha, bnan),
+                     std::domain_error,
+                     "poisson_log_glm_lpmf: Weight vector[0] is nan, "
+                     "but must be finite!");
+  }
+  {  // non-finite scalar alpha: deferred class, fires after the beta check
+    var ainf = std::numeric_limits<double>::infinity();
+    EXPECT_THROW_MSG(stan::math::poisson_log_glm_lpmf(y, x, ainf, beta),
+                     std::domain_error,
+                     "poisson_log_glm_lpmf: Intercept is inf, "
+                     "but must be finite!");
+  }
+  {  // non-finite x: the quirky third deferred check reports theta under
+     // the "Matrix of independent variables" label, at the bad element
+    Matrix<double, Dynamic, Dynamic> xinf = x;
+    xinf(3, 0) = std::numeric_limits<double>::infinity();
+    EXPECT_THROW_MSG(stan::math::poisson_log_glm_lpmf(y, xinf, alpha, beta),
+                     std::domain_error,
+                     "poisson_log_glm_lpmf: Matrix of independent variables[3]"
+                     " is inf, but must be finite!");
+  }
+}
+
+TEST_F(AgradRev, poisson_glm_fused_interior_paths_w122) {
+  using Eigen::Dynamic;
+  using Eigen::Matrix;
+  using Eigen::RowVectorXd;
+  using stan::math::var;
+  using std::vector;
+  // all-zero y with vector alpha (the fold-from-element-0 path)
+  {
+    vector<int> y(6, 0);
+    Matrix<double, Dynamic, Dynamic> x(6, 2);
+    x << -1, 2, 2, -3, -4, 5, 6, -7, -8, 9, 10, -11;
+    Matrix<var, Dynamic, 1> alpha(6, 1);
+    alpha << -0.5, -0.4, -0.3, -0.2, -0.1, 0.0;
+    Matrix<var, Dynamic, 1> beta(2, 1);
+    beta << 0.3, -0.7;
+    var lp = stan::math::poisson_log_glm_lpmf(y, x, alpha, beta);
+    lp.grad();
+    // reference: lp = sum(y*theta - exp(theta)), dalpha_i = y_i - e^theta_i
+    for (int i = 0; i < 6; ++i) {
+      double theta = x.row(i) * Eigen::Vector2d(0.3, -0.7)
+                     + value_of(alpha(i));
+      EXPECT_FLOAT_EQ(0.0 - std::exp(theta), alpha(i).adj());
+    }
+    EXPECT_FLOAT_EQ(lp.val(), lp.val());  // finite
+    stan::math::recover_memory();
+  }
+  // deep underflow: theta ~ -800, exp underflows to 0, no throw
+  {
+    vector<int> y{2, 0, 3};
+    Matrix<double, Dynamic, Dynamic> x(3, 1);
+    x << 0.1, -0.2, 0.3;
+    var alpha = -801.0;
+    Matrix<var, Dynamic, 1> beta(1, 1);
+    beta << 1.0;
+    var lp = stan::math::poisson_log_glm_lpmf(y, x, alpha, beta);
+    lp.grad();
+    EXPECT_TRUE(std::isfinite(lp.val()));
+    EXPECT_FLOAT_EQ(2.0, alpha.adj());  // y - e^theta = y - 0
+    stan::math::recover_memory();
+  }
+  // row-vector x (T_x_rows == 1) + repeated gradient evaluation
+  {
+    vector<int> y{7, 2, 0};
+    RowVectorXd x(2);
+    x << 0.5, -0.25;
+    Matrix<var, Dynamic, 1> beta(2, 1);
+    beta << 0.4, -0.6;
+    var alpha = 1.1;
+    var lp = stan::math::poisson_log_glm_lpmf(y, x, alpha, beta);
+    lp.grad();
+    double a1 = alpha.adj(), b1 = beta(0).adj();
+    var lp2 = stan::math::poisson_log_glm_lpmf(y, x, alpha, beta);
+    lp2.grad();
+    EXPECT_FLOAT_EQ(a1, alpha.adj() - a1);  // second eval adds the same adj
+    EXPECT_FLOAT_EQ(b1, beta(0).adj() - b1);
+    stan::math::recover_memory();
+  }
+}
