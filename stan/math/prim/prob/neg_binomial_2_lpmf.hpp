@@ -20,6 +20,19 @@ namespace stan {
 namespace math {
 
 // NegBinomial(n|mu, phi)  [mu >= 0; phi > 0;  n >= 0]
+//
+// The interior is a single fused scalar-sequential pass over the
+// max-consistent size (W-123 restructure of the scalar-loop-era Eigen
+// expression chain). Per-element operation order, the transcendental call
+// sequence (binomial_coefficient_log -> lgamma, log, log1p, digamma,
+// multiply_log), every check, and the left-fold accumulations (the logp
+// sum; the scalar-edge partial sums) are preserved exactly as the stock
+// expression evaluation produced them: Eigen's DefaultTraversal redux
+// folds from element 0, so element 0 seeds the accumulators and the loop
+// runs from 1. Redundant recomputations of identical values (log(mu+phi)
+// evaluated twice per element, mu+phi and n+phi recomputed per pass, the
+// discarded operand of the select) are computed once; each is the same
+// libm/boost function on the same inputs, so values are bit-identical.
 template <bool propto, typename T_n, typename T_location, typename T_precision,
           require_all_not_nonscalar_prim_or_rev_kernel_expression_t<
               T_n, T_location, T_precision>* = nullptr>
@@ -57,38 +70,136 @@ inline return_type_t<T_location, T_precision> neg_binomial_2_lpmf(
   auto phi_vec = as_array_or_scalar(as_column_vector_or_scalar(phi_ref));
   decltype(auto) mu_val = value_of(mu_vec);
   decltype(auto) phi_val = value_of(phi_vec);
+  auto n_val = value_of(n_vec);
   auto log_phi = log(phi_val);
-  auto mu_plus_phi = mu_val + phi_val;
-  auto log_mu_plus_phi = log(mu_plus_phi);
-  auto n_plus_phi = value_of(n_vec) + phi_val;
   constexpr bool include_precision
       = include_summand<propto, T_precision>::value;
   constexpr bool include_location = include_summand<propto, T_location>::value;
-  auto logp_calc = [&]() {
-    return -phi_val * (log1p(mu_val / phi_val))
-           - value_of(n_vec) * log_mu_plus_phi;
+  // digamma(phi) for a scalar phi is one call per lpmf evaluation (stock
+  // evaluates it once at the precision-partials statement); a vector phi
+  // evaluates it per element inside the pass below, as stock's lazy
+  // expression node did.
+  T_partials_return digamma_phi_scalar = 0.0;
+  if constexpr (is_autodiff_v<T_precision>
+                && std::is_arithmetic_v<std::decay_t<decltype(phi_val)>>) {
+    digamma_phi_scalar = digamma(phi_val);
+  }
+  // element accessor: Eigen containers index, arithmetic scalars broadcast
+  auto elem = [](const auto& x, Eigen::Index i) {
+    using X = std::decay_t<decltype(x)>;
+    if constexpr (std::is_arithmetic_v<X>) {
+      return x;
+    } else {
+      return x[i];
+    }
   };
-  if constexpr (include_precision || include_location) {
-    if constexpr (include_precision && include_location) {
-      logp += sum(binomial_coefficient_log(n_plus_phi - 1, n_vec)
-                  + multiply_log(n_vec, mu_val) + logp_calc());
-    } else if constexpr (include_precision) {
-      logp
-          += sum(binomial_coefficient_log(n_plus_phi - 1, n_vec) + logp_calc());
-    } else if constexpr (include_location) {
-      logp += sum(multiply_log(n_vec, mu_val) + logp_calc());
+  auto log_phi_at = [&](Eigen::Index i) -> T_partials_return {
+    if constexpr (std::is_arithmetic_v<std::decay_t<decltype(log_phi)>>) {
+      return log_phi;
+    } else {
+      return static_cast<T_partials_return>(log_phi[i]);
+    }
+  };
+  auto digamma_phi_at = [&](Eigen::Index i) -> T_partials_return {
+    if constexpr (std::is_arithmetic_v<std::decay_t<decltype(phi_val)>>) {
+      return digamma_phi_scalar;
+    } else {
+      return digamma(elem(phi_val, i));
+    }
+  };
+
+  T_partials_return p_mu_i = 0.0;
+  T_partials_return p_phi_i = 0.0;
+  // One fused scalar-sequential pass. Per element this evaluates, in stock
+  // order: the logp term (binomial_coefficient_log(n+phi-1, n) +
+  // multiply_log(n, mu) + (-phi)*log1p(mu/phi) - n*log(mu+phi)), then the
+  // location partial (n/mu - (n+phi)/(mu+phi)), then the precision partial
+  // ((mu-n)/(mu+phi) + select(mu<phi, log1p(-mu/(mu+phi)), log(phi) -
+  // log(mu+phi)) - digamma(phi) + digamma(n+phi)).
+  auto element_work = [&](Eigen::Index i) -> T_partials_return {
+    const auto n_o = elem(n_val, i);
+    const T_partials_return n_d = static_cast<T_partials_return>(n_o);
+    const T_partials_return mu_v = elem(mu_val, i);
+    const T_partials_return phi_v = elem(phi_val, i);
+    const T_partials_return mu_plus_phi = mu_v + phi_v;
+    const T_partials_return log_mu_plus_phi = log(mu_plus_phi);
+    const T_partials_return n_plus_phi = n_d + phi_v;
+    if constexpr (include_precision || include_location) {
+      const T_partials_return calc = -phi_v * log1p(mu_v / phi_v)
+                                     - n_d * log_mu_plus_phi;
+      T_partials_return term = 0;
+      if constexpr (include_precision && include_location) {
+        term = binomial_coefficient_log(n_plus_phi - 1.0, n_o)
+               + multiply_log(n_o, mu_v) + calc;
+      } else if constexpr (include_precision) {
+        term = binomial_coefficient_log(n_plus_phi - 1.0, n_o) + calc;
+      } else {
+        term = multiply_log(n_o, mu_v) + calc;
+      }
+      if constexpr (is_autodiff_v<T_location>) {
+        p_mu_i = n_d / mu_v - n_plus_phi / mu_plus_phi;
+      }
+      if constexpr (is_autodiff_v<T_precision>) {
+        const T_partials_return digamma_n_plus_phi = digamma(n_plus_phi);
+        T_partials_return log_term;
+        if (mu_v < phi_v) {
+          log_term = log1p(-mu_v / mu_plus_phi);
+        } else {
+          log_term = log_phi_at(i) - log_mu_plus_phi;
+        }
+        p_phi_i = (mu_v - n_d) / mu_plus_phi + log_term
+                  - digamma_phi_at(i) + digamma_n_plus_phi;
+      }
+      return term;
+    } else {
+      return 0;
+    }
+  };
+
+  const Eigen::Index size = max_size(n_ref, mu_ref, phi_ref);
+  // DefaultTraversal redux: element 0 seeds each accumulation, the loop
+  // folds from 1 (stock's unpeeled prologue + loop shape).
+  T_partials_return lp_acc = element_work(0);
+  T_partials_return mu_acc = p_mu_i;
+  T_partials_return phi_acc = p_phi_i;
+  if constexpr (is_autodiff_v<T_location>) {
+    if constexpr (!is_stan_scalar_v<std::decay_t<T_mu_ref>>) {
+      partials<0>(ops_partials).coeffRef(0) = p_mu_i;
     }
   }
+  if constexpr (is_autodiff_v<T_precision>) {
+    if constexpr (!is_stan_scalar_v<std::decay_t<T_phi_ref>>) {
+      partials<1>(ops_partials).coeffRef(0) = p_phi_i;
+    }
+  }
+  for (Eigen::Index i = 1; i < size; ++i) {
+    const T_partials_return term = element_work(i);
+    lp_acc = lp_acc + term;
+    if constexpr (is_autodiff_v<T_location>) {
+      if constexpr (is_stan_scalar_v<std::decay_t<T_mu_ref>>) {
+        mu_acc = mu_acc + p_mu_i;
+      } else {
+        partials<0>(ops_partials).coeffRef(i) = p_mu_i;
+      }
+    }
+    if constexpr (is_autodiff_v<T_precision>) {
+      if constexpr (is_stan_scalar_v<std::decay_t<T_phi_ref>>) {
+        phi_acc = phi_acc + p_phi_i;
+      } else {
+        partials<1>(ops_partials).coeffRef(i) = p_phi_i;
+      }
+    }
+  }
+  logp += lp_acc;
   if constexpr (is_autodiff_v<T_location>) {
-    partials<0>(ops_partials)
-        = n_vec / mu_val - (n_vec + phi_val) / mu_plus_phi;
+    if constexpr (is_stan_scalar_v<std::decay_t<T_mu_ref>>) {
+      partials<0>(ops_partials)[0] = mu_acc;
+    }
   }
   if constexpr (is_autodiff_v<T_precision>) {
-    auto log_term = select(mu_val < phi_val, log1p(-mu_val / mu_plus_phi),
-                           log_phi - log_mu_plus_phi);
-    partials<1>(ops_partials) = (mu_val - value_of(n_vec)) / mu_plus_phi
-                                + log_term - digamma(phi_val)
-                                + digamma(n_plus_phi);
+    if constexpr (is_stan_scalar_v<std::decay_t<T_phi_ref>>) {
+      partials<1>(ops_partials)[0] = phi_acc;
+    }
   }
   return ops_partials.build(logp);
 }
