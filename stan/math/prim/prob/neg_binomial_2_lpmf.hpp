@@ -125,8 +125,16 @@ inline return_type_t<T_location, T_precision> neg_binomial_2_lpmf(
     const T_partials_return log_mu_plus_phi = log(mu_plus_phi);
     const T_partials_return n_plus_phi = n_d + phi_v;
     if constexpr (include_precision || include_location) {
-      const T_partials_return calc = -phi_v * log1p(mu_v / phi_v)
-                                     - n_d * log_mu_plus_phi;
+      // logp_calc(), with the (-phi)*log1p product in its own statement so
+      // that the only FMA-fusable product at -mfma levels is n*log(mu+phi)
+      // — the product stock's compiled expression fuses (vfnmadd231sd:
+      // fl(fl(-phi*log1p) - (n*lmp)_exact), verified in stock disassembly
+      // of both the worktree and bundle environments; at -O2 the shape is
+      // mulsd+mulsd+subsd in both).
+      const T_partials_return neg_phi_log1p
+          = -phi_v * log1p(mu_v / phi_v);
+      const T_partials_return calc
+          = neg_phi_log1p - n_d * log_mu_plus_phi;
       T_partials_return term = 0;
       if constexpr (include_precision && include_location) {
         term = binomial_coefficient_log(n_plus_phi - 1.0, n_o)
