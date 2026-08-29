@@ -48,6 +48,12 @@ struct Inputs {
           Eigen::Matrix<double, Dynamic, 1>>(t);
     }
   }
+  // layout 2: theta viewed as the deserializer's default-level Map over the
+  // AoS var buffer
+  Eigen::Map<const Matrix<var, Dynamic, 1>> theta_map() const {
+    return Eigen::Map<const Matrix<var, Dynamic, 1>>(theta_a.data(),
+                                                     theta_a.size());
+  }
   Eigen::Matrix<double, Dynamic, 1> adj_theta() const {
     Eigen::Matrix<double, Dynamic, 1> g(theta_a.size());
     if constexpr (layout == 1) {
@@ -80,11 +86,19 @@ struct Inputs {
 template <int layout>
 var composed_stock(const std::vector<int>& y, const Inputs<layout>& in,
                    const std::vector<int>& ii, const std::vector<int>& jj) {
-  return stan::math::bernoulli_logit_lpmf<false>(
-      y, stan::math::elt_multiply(
-             gather(in.alpha_a, ii),
-             stan::math::subtract(gather(in.theta_a, jj),
-                                  gather(in.beta_a, ii))));
+  if constexpr (layout == 2) {
+    return stan::math::bernoulli_logit_lpmf<false>(
+        y, stan::math::elt_multiply(
+               gather(in.alpha_a, ii),
+               stan::math::subtract(gather(in.theta_map(), jj),
+                                    gather(in.beta_a, ii))));
+  } else {
+    return stan::math::bernoulli_logit_lpmf<false>(
+        y, stan::math::elt_multiply(
+               gather(in.alpha_a, ii),
+               stan::math::subtract(gather(in.theta_a, jj),
+                                    gather(in.beta_a, ii))));
+  }
 }
 
 template <int layout>
@@ -93,6 +107,9 @@ var primitive(const std::vector<int>& y, const Inputs<layout>& in,
   if constexpr (layout == 1) {
     return stan::math::bernoulli_logit_lpmf_gathered<false>(
         y, in.theta_s, jj, in.alpha_a, in.beta_a, ii);
+  } else if constexpr (layout == 2) {
+    return stan::math::bernoulli_logit_lpmf_gathered<false>(
+        y, in.theta_map(), jj, in.alpha_a, in.beta_a, ii);
   } else {
     return stan::math::bernoulli_logit_lpmf_gathered<false>(
         y, in.theta_a, jj, in.alpha_a, in.beta_a, ii);
@@ -168,9 +185,12 @@ TEST(RevProbBernoulliLogitGathered, BitIdenticalToComposedStock) {
       y[k] = static_cast<int>(rng() % 2);
     }
     // layout 0: all Matrix<var>; layout 1: theta as var_value<> (the
-    // layout the generated hier_2pl model uses for a parameter vector)
+    // layout an O1-level hpp uses for a parameter vector); layout 2:
+    // theta as Map<const Matrix<var>> (the DEFAULT-level deserializer
+    // layout, the W-108.1 case)
     expect_bit_identical<0>(theta, alpha, beta, ii, jj, y);
     expect_bit_identical<1>(theta, alpha, beta, ii, jj, y);
+    expect_bit_identical<2>(theta, alpha, beta, ii, jj, y);
   }
 }
 
