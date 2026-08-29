@@ -24,14 +24,16 @@ namespace internal {
 // Fused per-element worker for neg_binomial_2_lpmf (W-123 restructure):
 // evaluates one element's logp term, location partial, and precision
 // partial in stock's per-element order. always_inline: the pass loop must
-// not pay a per-element call (GCC otherwise outlines a capturing lambda).
+// not pay a per-element call by default; GCC may still outline it when
+// that is cheaper (measured: forced inlining costs ~10 Ir/elem in register
+// pressure, outlining ~10 Ir/elem in call overhead — near-neutral).
 // phi_scalar = phi_val is an arithmetic scalar (broadcast); then log_phi
 // is the precomputed scalar log(phi) and digamma_phi_scalar the one
 // per-call digamma(phi).
 template <bool include_precision, bool include_location, bool mu_autodiff,
           bool phi_autodiff, bool phi_scalar, typename TN, typename TMU,
           typename TPHI, typename TLOGPHI>
-__attribute__((always_inline)) inline double nb2_element_work(
+inline double nb2_element_work(
     Eigen::Index i, const TN& n_val, const TMU& mu_val, const TPHI& phi_val,
     const TLOGPHI& log_phi, double digamma_phi_scalar, double& p_mu_i,
     double& p_phi_i) {
