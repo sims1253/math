@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 #include <limits>
 #include <random>
+#include <string>
 #include <vector>
 
 // The gathered normal likelihood must be BIT-IDENTICAL to the loop the Stan
@@ -283,4 +284,108 @@ TEST(RevProbNormalLpdfGathered, SizeZero) {
       y, Matrix<var, Dynamic, 1>(a), std::vector<int>{}, var(1.0));
   EXPECT_EQ(terms.size(), 0);
   stan::math::recover_memory();
+}
+
+// W-112.2: THROW-SET parity -- on invalid states the primitive must
+// throw exactly what the composed stock loop throws (same type, same
+// message, hence the same first-failing element in stock's per-element
+// check order). The stock loop's check_finite(mu) converts non-finite-mu
+// states into exceptions the sampler treats as (logp=-inf, grad=0); a
+// silently-computed NaN/-inf lp with NaN gradients does not reproduce
+// that observable behavior (the W-116b radon_var divergence mechanism).
+TEST(RevProbNormalLpdfGathered, ThrowSetParity) {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+  struct Case {
+    bool shapeB;
+    int y_nan;
+    int a_bad;    // alpha coefficient made +inf
+    int b_bad;    // beta coefficient made NaN
+    double sigma;
+  };
+  const Case cases[] = {
+      {true, -1, 3, -1, 1.0},    // mu = +inf
+      {true, -1, -1, 5, 1.0},    // mu = NaN
+      {false, -1, 2, -1, 1.0},   // shape A mu = +inf
+      {true, 4, 1, -1, 1.0},     // mu bad at element 1, y NaN at 4
+      {true, -1, -1, -1, 0.0},   // sigma = 0
+  };
+  for (const auto& tc : cases) {
+    const int J = 9, N = 24;
+    VectorXd y(N), a(J), b(J), x(N);
+    for (int n = 0; n < N; ++n) {
+      y(n) = 0.3 * n;
+      x(n) = 1.5;
+    }
+    for (int j = 0; j < J; ++j) {
+      a(j) = 0.2 * j;
+      b(j) = 0.1 * j;
+    }
+    std::vector<int> ii(N);
+    for (int k = 0; k < N; ++k) {
+      ii[k] = 1 + (k % J);
+    }
+    if (tc.y_nan >= 0) {
+      y(tc.y_nan) = nan;
+    }
+    if (tc.a_bad >= 0) {
+      a(tc.a_bad) = inf;
+    }
+    if (tc.b_bad >= 0) {
+      b(tc.b_bad) = nan;
+    }
+    std::string msg0, msg1;
+    {
+      var sigma(tc.sigma);
+      try {
+        var lp = tc.shapeB ? stock_loop(y, Matrix<var, Dynamic, 1>(a), ii, x,
+                                        Matrix<var, Dynamic, 1>(b), ii, sigma)
+                           : stock_loop(y, Matrix<var, Dynamic, 1>(a), ii,
+                                        sigma);
+        (void)lp;
+        msg0 = "<no-throw>";
+      } catch (const std::domain_error& e) {
+        msg0 = e.what();
+      }
+      stan::math::recover_memory();
+    }
+    {
+      Coeffs<0> alpha(a), beta(b);
+      var sigma(tc.sigma);
+      stan::math::accumulator<var> lp_accum;
+      try {
+        std::vector<var> terms;
+        if (tc.shapeB) {
+          terms = stan::math::normal_lpdf_gathered<false>(
+              y, alpha.aos, ii, x, beta.aos, ii, sigma);
+        } else {
+          terms = stan::math::normal_lpdf_gathered<false>(y, alpha.aos, ii,
+                                                          sigma);
+        }
+        for (const auto& t : terms) {
+          lp_accum.add(t);
+        }
+        var lp = lp_accum.sum();
+        (void)lp;
+        msg1 = "<no-throw>";
+      } catch (const std::domain_error& e) {
+        msg1 = e.what();
+      }
+      stan::math::recover_memory();
+    }
+    // The sigma<=0 message differs only in the function-name prefix
+    // (normal_lpdf vs normal_lpdf_gathered): normalize before compare.
+    const std::string p = "normal_lpdf: ", g = "normal_lpdf_gathered: ";
+    if (msg0.rfind(p, 0) == 0) {
+      msg0 = msg0.substr(p.size());
+    }
+    if (msg1.rfind(p, 0) == 0) {
+      msg1 = msg1.substr(p.size());
+    }
+    if (msg1.rfind(g, 0) == 0) {
+      msg1 = msg1.substr(g.size());
+    }
+    EXPECT_NE(msg0, "<no-throw>") << "stock must throw (case sigma=" << tc.sigma << ")";
+    EXPECT_EQ(msg0, msg1) << "throw-set/message parity";
+  }
 }
