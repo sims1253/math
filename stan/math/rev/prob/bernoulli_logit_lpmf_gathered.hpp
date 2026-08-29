@@ -42,16 +42,27 @@ namespace math {
  * value and the partials, Eigen's `sum` over the same expression types). The
  * reverse pass is ONE callback vari that performs the same scatter-adds, in
  * the same k order, that stock's elt_multiply / subtract callbacks perform
- * through their aliased gathered records:
+ * through their aliased gathered records, AT THE MACHINE-CODE SCHEDULE
+ * level (W-108.1): stock's elt_multiply chain accumulates a Matrix<var>
+ * alpha with a fused multiply-add, computes the subtraction output's
+ * increment as ONE rounded product, and subtract's chain applies that
+ * product to theta with a pure add and to beta with a pure subtract:
  *
- *   alpha[ii[k]]_adj += (theta[jj[k]] - beta[ii[k]]) * (w * dtheta[k])
- *   theta[jj[k]]_adj +=  alpha[ii[k]]              * (w * dtheta[k])
- *   beta[ii[k]]_adj  -=  alpha[ii[k]]              * (w * dtheta[k])
+ *   alpha[ii[k]]_adj  += fma((theta[jj[k]] - beta[ii[k]]), (w*dtheta[k]),
+ *                            alpha[ii[k]]_adj)          [AoS alpha, fused]
+ *   inc                =  round(alpha[ii[k]] * (w*dtheta[k]))
+ *   theta[jj[k]]_adj  += inc
+ *   beta[ii[k]]_adj   -= inc
  *
- * with `w` the adjoint of the returned log probability and `dtheta` the
- * elementwise partial of `bernoulli_logit_lpmf` (including its branch
- * behavior at `|ntheta| > 20`). Values and every gradient component are
- * bit-identical to the composed stock path.
+ * (SoA `var_value<>` operands reach their adjoints through rvalue_varmat's
+ * gather, whose scatter is a pure add, so every SoA-route increment is a
+ * rounded product followed by an unfused add/sub.) `w` is the adjoint of the
+ * returned log probability and `dtheta` the elementwise partial of
+ * `bernoulli_logit_lpmf` (including its branch behavior at `|ntheta| > 20`).
+ * Values and every gradient component are bit-identical to the composed
+ * stock path in EVERY operand layout the stanc deserializer produces
+ * (`Matrix<var>`, `var_value<Matrix<double>>`, and `Map<const Matrix<var>>`
+ * - the default-level deserializer layout).
  *
  * @tparam propto if `true`, normalize out constant terms (there are none for
  * this distribution; the flag is kept for drop-in symmetry with
@@ -210,24 +221,39 @@ inline var bernoulli_logit_lpmf_gathered(const T_n& n, const T_theta& theta,
           const double e = w * dtheta.coeff(k);
           const int ik = ii_arena.coeff(k);
           const int jk = jj_arena.coeff(k);
-          // elt_multiply callback: alpha gets sub_val * e, the subtraction
-          // output gets a_val * e ...
+          // The adjoint arithmetic replicates the machine-code schedule of
+          // the composed stock expression (W-108.1, decoded from the
+          // elt_multiply / subtract reverse chains):
+          //  - elt_multiply's chain accumulates a Matrix<var> alpha with a
+          //    FUSED multiply-add (vfmadd213sd: alpha_adj += sub_val * e in
+          //    one expression, one rounding of the sum);
+          //  - the subtraction output's increment is ONE ROUNDED PRODUCT
+          //    (the chain's fma into its zero-initialized record), which
+          //    subtract's chain then applies to theta with a PURE ADD and to
+          //    beta with a PURE SUB (vaddsd / vsubsd - two roundings total).
+          //  - var_value<> (SoA) operands flow through rvalue_varmat's
+          //    gather, whose scatter is a pure add, so their alpha increment
+          //    is also a rounded product followed by an add.
+          // The `volatile` barriers force the unfused forms (GCC's
+          // fp-contract=fast re-fuses plain statement splits); keeping AoS
+          // alpha's statement in one expression lets the compiler fuse it
+          // exactly as stock's chain does.
           if constexpr (is_var_v<std::decay_t<T_alpha>>) {
-            alpha_soa->adj_.coeffRef(ik) += sub_val.coeff(k) * e;
+            volatile const double ainc = sub_val.coeff(k) * e;
+            alpha_soa->adj_.coeffRef(ik) += ainc;
           } else {
             alpha_vi.coeff(ik)->adj_ += sub_val.coeff(k) * e;
           }
-          // ... subtract callback: theta gets the subtraction output's
-          // adjoint, beta gets its negation.
+          volatile const double inc = a_val.coeff(k) * e;
           if constexpr (is_var_v<std::decay_t<T_theta>>) {
-            theta_soa->adj_.coeffRef(jk) += a_val.coeff(k) * e;
+            theta_soa->adj_.coeffRef(jk) += inc;
           } else {
-            theta_vi.coeff(jk)->adj_ += a_val.coeff(k) * e;
+            theta_vi.coeff(jk)->adj_ += inc;
           }
           if constexpr (is_var_v<std::decay_t<T_beta>>) {
-            beta_soa->adj_.coeffRef(ik) -= a_val.coeff(k) * e;
+            beta_soa->adj_.coeffRef(ik) -= inc;
           } else {
-            beta_vi.coeff(ik)->adj_ -= a_val.coeff(k) * e;
+            beta_vi.coeff(ik)->adj_ -= inc;
           }
         }
       });
