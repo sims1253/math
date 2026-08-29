@@ -206,6 +206,43 @@ void run_case_B(const VectorXd& y, const VectorXd& alpha_d,
   EXPECT_TRUE(bits_equal(s0, s1)) << "B d/dsigma: " << s0 << " vs " << s1;
 }
 
+// W-118: bounds-guarded stock loops for the strict-order throw cases.
+// The simplified reference above indexes directly (fine for valid
+// states); the out-of-range cases need the generated loop's rvalue
+// semantics, reproduced here with the same check_range call the
+// primitive's cold path makes (identical exception + message).
+var stock_loop_guarded(const VectorXd& y, const Matrix<var, Dynamic, 1>& alpha,
+                       const std::vector<int>& ii, const var& sigma) {
+  const int N = (int)y.size();
+  const int J = (int)alpha.size();
+  stan::math::accumulator<var> lp_accum;
+  for (int n = 1; n <= N; ++n) {
+    stan::math::check_range("vector[uni] indexing", "alpha", J, ii[n - 1]);
+    lp_accum.add(stan::math::normal_lpdf<false>(
+        y.coeff(n - 1), alpha.coeff(ii[n - 1] - 1), sigma));
+  }
+  return lp_accum.sum();
+}
+
+var stock_loop_guarded(const VectorXd& y, const Matrix<var, Dynamic, 1>& alpha,
+                       const std::vector<int>& ii, const VectorXd& x,
+                       const Matrix<var, Dynamic, 1>& beta,
+                       const std::vector<int>& ii2, const var& sigma) {
+  const int N = (int)y.size();
+  const int JA = (int)alpha.size();
+  const int JB = (int)beta.size();
+  stan::math::accumulator<var> lp_accum;
+  for (int n = 1; n <= N; ++n) {
+    stan::math::check_range("vector[uni] indexing", "alpha", JA, ii[n - 1]);
+    stan::math::check_range("vector[uni] indexing", "beta", JB, ii2[n - 1]);
+    lp_accum.add(stan::math::normal_lpdf<false>(
+        y.coeff(n - 1),
+        alpha.coeff(ii[n - 1] - 1) + x.coeff(n - 1) * beta.coeff(ii2[n - 1] - 1),
+        sigma));
+  }
+  return lp_accum.sum();
+}
+
 }  // namespace
 
 TEST(RevProbNormalLpdfGathered, BitIdenticalToComposedStock) {
@@ -387,5 +424,209 @@ TEST(RevProbNormalLpdfGathered, ThrowSetParity) {
     }
     EXPECT_NE(msg0, "<no-throw>") << "stock must throw (case sigma=" << tc.sigma << ")";
     EXPECT_EQ(msg0, msg1) << "throw-set/message parity";
+  }
+}
+
+// ================= W-118: fused-interior additions =================
+
+// N spanning SIMD widths and remainders (AVX2: 4 double lanes): the
+// vectorized term pass and its scalar epilogue must stay bit-identical
+// to the composed stock loop at every width/remainder combination.
+TEST(RevProbNormalLpdfGathered, FusionEdgeWidths) {
+  std::mt19937 rng(20260829);
+  std::normal_distribution<double> nd(0.0, 1.0);
+  const long long Ns[] = {1, 2, 3, 4, 5, 6, 7, 8, 15, 16, 17,
+                          31, 32, 33, 100, 919, 12573};
+  for (long long N : Ns) {
+    const int J = (int)std::min<long long>(1 + N / 3 + 3, 400);
+    VectorXd y(N), a(J), b(J), x(N);
+    for (long long n = 0; n < N; ++n) {
+      y(n) = nd(rng) * 1.5;
+      x(n) = ((n % 7 == 0) ? 0.0 : ((n % 5 == 0) ? -1.25 : 1.0 + 0.5 * nd(rng)));
+    }
+    for (int j = 0; j < J; ++j) {
+      a(j) = nd(rng);
+      b(j) = nd(rng) * 0.5;
+    }
+    std::vector<int> ii(N), ii2(N), iip(N);
+    for (long long k = 0; k < N; ++k) {
+      ii[k] = 1 + (int)(rng() % J);
+      ii2[k] = 1 + (int)(rng() % J);
+      iip[k] = 1 + (int)(k % J);
+    }
+    run_case_A<0>(y, a, ii, 0.9, true);
+    run_case_A<1>(y, a, iip, 0.5, false);
+    run_case_B<0>(y, a, ii, x, b, ii, 0.7, true);
+    run_case_B<1>(y, a, iip, x, b, ii2, 1e-3, false);
+  }
+  // single-coefficient degenerate: every lane gathers the same index
+  const int N = 300;
+  VectorXd y(N), a(1), b(1), x(N);
+  for (int n = 0; n < N; ++n) {
+    y(n) = nd(rng);
+    x(n) = 1.0;
+  }
+  a(0) = 0.25;
+  b(0) = -0.5;
+  std::vector<int> ones(N, 1);
+  run_case_A<0>(y, a, ones, 1.0, true);
+  run_case_B<0>(y, a, ones, x, b, ones, 1.0, true);
+}
+
+// The strict per-element throw ORDER (alpha index, beta index, y, mu) on
+// mixed-defect states: the cold path re-derives stock's order exactly,
+// including defects at different elements and two defects at one element.
+TEST(RevProbNormalLpdfGathered, StrictOrderThrowSet) {
+  struct Case {
+    bool shapeB;
+    int y_nan_idx;
+    int bad_a_idx_k;
+    int a_oob;
+    int bad_b_idx_k;
+    int b_oob;
+  };
+  const Case cases[] = {
+      {false, 0, 5, 0, -1, 0},   // y-NaN@0 vs bad index@5: y wins
+      {false, 2, 0, 99, -1, 0},  // bad index@0 vs y-NaN@2: range wins
+      {false, -1, 1, -1, -1, 0},  // negative index
+      {false, -1, 3, 99, -1, 0},  // index one past the end
+      {true, 2, 1, 99, -1, 0},   // B: alpha index bad at earlier element
+      {true, -1, -1, 0, 0, -3},  // B: beta index bad at element 0
+      {true, 0, 0, 0, -1, 0},    // same element: bounds before y
+  };
+  const int J = 12, N = 30;
+  std::mt19937 rng(20260830);
+  std::normal_distribution<double> nd(0.0, 1.0);
+  for (const auto& tc : cases) {
+    VectorXd y(N), a(J), b(J), x(N);
+    for (int n = 0; n < N; ++n) y(n) = nd(rng) * 0.5;
+    for (int j = 0; j < J; ++j) {
+      a(j) = nd(rng);
+      b(j) = nd(rng) * 0.5;
+    }
+    for (int n = 0; n < N; ++n) x(n) = 2.0;
+    std::vector<int> ii(N), ii2(N);
+    for (int k = 0; k < N; ++k) {
+      ii[k] = 1 + (k % J);
+      ii2[k] = 1 + ((k * 5 + 3) % J);
+    }
+    if (tc.y_nan_idx >= 0)
+      y(tc.y_nan_idx) = std::numeric_limits<double>::quiet_NaN();
+    if (tc.bad_a_idx_k >= 0) ii[tc.bad_a_idx_k] = tc.a_oob;
+    if (tc.bad_b_idx_k >= 0) ii2[tc.bad_b_idx_k] = tc.b_oob;
+    std::string msg0, msg1;
+    {
+      Matrix<var, Dynamic, 1> aa(a), bb(b);
+      var sigma(1.0);
+      try {
+        var lp = tc.shapeB ? stock_loop_guarded(y, aa, ii, x, bb, ii2, sigma)
+                           : stock_loop_guarded(y, aa, ii, sigma);
+        (void)lp;
+        msg0 = "<no-throw>";
+      } catch (const std::exception& e) {
+        msg0 = e.what();
+      }
+      stan::math::recover_memory();
+    }
+    stan::math::recover_memory();
+    {
+      Matrix<var, Dynamic, 1> aa(a), bb(b);
+      var sigma(1.0);
+      stan::math::accumulator<var> lp_accum;
+      try {
+        std::vector<var> terms
+            = tc.shapeB
+                  ? stan::math::normal_lpdf_gathered<false>(y, aa, ii, x,
+                                                            bb, ii2, sigma)
+                  : stan::math::normal_lpdf_gathered<false>(y, aa, ii, sigma);
+        for (const auto& t : terms) lp_accum.add(t);
+        var lp = lp_accum.sum();
+        (void)lp;
+        msg1 = "<no-throw>";
+      } catch (const std::exception& e) {
+        msg1 = e.what();
+      }
+      stan::math::recover_memory();
+    }
+    stan::math::recover_memory();
+    EXPECT_NE(msg0, "<no-throw>") << "stock must throw (case y=" << tc.y_nan_idx
+                                  << " a@" << tc.bad_a_idx_k << ")";
+    EXPECT_EQ(msg0, msg1) << "strict-order throw parity";
+  }
+}
+
+// The W-53-class batched term records must zero-and-re-accumulate exactly
+// like the stock loop's per-element var(double) records across repeated
+// grad() calls on ONE tape (set_zero_all_adjoints between calls -- the
+// gathered_term_zeroer path).
+TEST(RevProbNormalLpdfGathered, BatchedRecordsRepeatedGrad) {
+  std::mt19937 rng(20260831);
+  std::normal_distribution<double> nd(0.0, 1.0);
+  const int J = 40, N = 500;
+  VectorXd y(N), a(J), b(J), x(N);
+  for (int n = 0; n < N; ++n) {
+    y(n) = nd(rng);
+    x(n) = (n % 3 == 0) ? -1.0 : 0.5;
+  }
+  for (int j = 0; j < J; ++j) {
+    a(j) = nd(rng);
+    b(j) = nd(rng) * 0.5;
+  }
+  std::vector<int> ii(N), ii2(N);
+  for (int k = 0; k < N; ++k) {
+    ii[k] = 1 + (int)(rng() % J);
+    ii2[k] = 1 + (int)(rng() % J);
+  }
+  double lp0[2], lp1[2], s0[2], s1[2];
+  VectorXd ga0[2], ga1[2], gb0[2], gb1[2];
+  {
+    Matrix<var, Dynamic, 1> aa(a), bb(b);
+    var sigma(0.8);
+    var lp = stock_loop(y, aa, ii, x, bb, ii2, sigma);
+    for (int rep = 0; rep < 2; ++rep) {
+      if (rep == 1) stan::math::set_zero_all_adjoints();
+      lp.grad();
+      lp0[rep] = lp.val();
+      ga0[rep].resize(J);
+      gb0[rep].resize(J);
+      for (int j = 0; j < J; ++j) {
+        ga0[rep](j) = aa.coeff(j).adj();
+        gb0[rep](j) = bb.coeff(j).adj();
+      }
+      s0[rep] = sigma.adj();
+    }
+    stan::math::recover_memory();
+  }
+  stan::math::recover_memory();
+  {
+    Matrix<var, Dynamic, 1> aa(a), bb(b);
+    var sigma(0.8);
+    stan::math::accumulator<var> lp_accum;
+    auto terms = stan::math::normal_lpdf_gathered<false>(y, aa, ii, x, bb,
+                                                         ii2, sigma);
+    for (const auto& t : terms) lp_accum.add(t);
+    var lp = lp_accum.sum();
+    for (int rep = 0; rep < 2; ++rep) {
+      if (rep == 1) stan::math::set_zero_all_adjoints();
+      lp.grad();
+      lp1[rep] = lp.val();
+      ga1[rep].resize(J);
+      gb1[rep].resize(J);
+      for (int j = 0; j < J; ++j) {
+        ga1[rep](j) = aa.coeff(j).adj();
+        gb1[rep](j) = bb.coeff(j).adj();
+      }
+      s1[rep] = sigma.adj();
+    }
+    stan::math::recover_memory();
+  }
+  stan::math::recover_memory();
+  for (int rep = 0; rep < 2; ++rep) {
+    EXPECT_TRUE(bits_equal(lp0[rep], lp1[rep]));
+    EXPECT_TRUE(bits_equal(s0[rep], s1[rep]));
+    for (int j = 0; j < J; ++j) {
+      EXPECT_TRUE(bits_equal(ga0[rep](j), ga1[rep](j)));
+      EXPECT_TRUE(bits_equal(gb0[rep](j), gb1[rep](j)));
+    }
   }
 }
