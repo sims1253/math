@@ -44,7 +44,7 @@ auto gather_aos(const EigVec& x, const Idx& idx) {
 template <typename Idx>
 soa_vec gather_soa(const soa_vec& x, const Idx& idx) {
   using stan::math::arena_allocator;
-  using stan::math::arena_t;
+  using stan::arena_t;
   using stan::math::check_range;
   using stan::math::reverse_pass_callback;
   using arena_std_vec = std::vector<int, arena_allocator<int>>;
@@ -170,29 +170,30 @@ TEST(RevFunDotSelfGatheredDiff, BitIdenticalToComposedStock) {
 }
 
 TEST(RevFunDotSelfGatheredDiff, ValueMatchesHandComputed) {
-  // d = (1.7 - (-0.3), 0.0, 2.5 - 1.7): dot_self = 4 + 0 + 0.64
+  // d = (1.7 - (-0.3), 0.0, 2.5 - 1.7, 2.5 - 1.7) = (2, 0, .8, .8)
+  // dot_self = 4 + 0 + .64 + .64
   VecD phi_d(3);
   phi_d << 1.7, -0.3, 2.5;
   std::vector<int> n1{1, 2, 3, 3}, n2{2, 2, 1, 1};
   {
     soa_vec phi_s(phi_d);
     var r = stan::math::dot_self_gathered_diff(phi_s, n1, n2);
-    EXPECT_DOUBLE_EQ(r.val(), 4.0 + 0.0 + 0.64);
+    EXPECT_DOUBLE_EQ(r.val(), 4.0 + 0.64 + 0.64);
     r.grad();
     // d/dphi[j] = 2*sum_e (phi[n1]-phi[n2])*(1[n1=j] - 1[n2=j])
-    EXPECT_DOUBLE_EQ(phi_s.vi_->adj_.coeff(0), 2 * (2.0 + 0.8));
+    EXPECT_DOUBLE_EQ(phi_s.vi_->adj_.coeff(0), 2 * 2.0 - 2 * 0.8 - 2 * 0.8);
     EXPECT_DOUBLE_EQ(phi_s.vi_->adj_.coeff(1), -4.0);
-    EXPECT_DOUBLE_EQ(phi_s.vi_->adj_.coeff(2), 0.0 + 1.6);
+    EXPECT_DOUBLE_EQ(phi_s.vi_->adj_.coeff(2), 2 * 0.8 + 2 * 0.8);
   }
   stan::math::recover_memory();
   {
     Matrix<var, Dynamic, 1> phi_a(phi_d);
     var r = stan::math::dot_self_gathered_diff(phi_a, n1, n2);
-    EXPECT_DOUBLE_EQ(r.val(), 4.0 + 0.0 + 0.64);
+    EXPECT_DOUBLE_EQ(r.val(), 4.0 + 0.64 + 0.64);
     r.grad();
-    EXPECT_DOUBLE_EQ(phi_a.coeff(0).adj(), 2 * (2.0 + 0.8));
+    EXPECT_DOUBLE_EQ(phi_a.coeff(0).adj(), 2 * 2.0 - 2 * 0.8 - 2 * 0.8);
     EXPECT_DOUBLE_EQ(phi_a.coeff(1).adj(), -4.0);
-    EXPECT_DOUBLE_EQ(phi_a.coeff(2).adj(), 0.0 + 1.6);
+    EXPECT_DOUBLE_EQ(phi_a.coeff(2).adj(), 2 * 0.8 + 2 * 0.8);
   }
   stan::math::recover_memory();
 }
