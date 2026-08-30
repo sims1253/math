@@ -276,6 +276,404 @@ inline var bernoulli_logit_lpmf_gathered(const T_n& n, const T_theta& theta,
   return bernoulli_logit_lpmf_gathered<true>(n, theta, jj, alpha, beta, ii);
 }
 
+// ---------------------------------------------------------------------------
+// Additive multi-gather predictor (W-127): eta[n] = intercept +
+// sum(data-product terms) + sum(gathered coefficient terms), the election88
+// class `y ~ bernoulli_logit(beta[1] + beta[2]*black + ... + a[age] + ...)`.
+// ---------------------------------------------------------------------------
+
+/** \ingroup prob_dists
+ * Leaf tag: a gathered coefficient term `coefs[idx[n]]` of the additive
+ * predictor. `coefs` is a vector of vars (`Eigen::Matrix<var,-1,1>` /
+ * `Map<const Matrix<var>>` for AoS layouts, `var_value<Matrix<double>>` for
+ * the SoA deserializer layout); `idx` holds 1-based observation indices.
+ * `name` is the Stan variable name used in range-check messages (parity with
+ * `rvalue`'s "vector[uni] indexing" text on the composed path).
+ */
+template <typename T_vec>
+struct gather_term {
+  const char* name;
+  const T_vec& coefs;
+  const std::vector<int>& idx;
+};
+template <typename T_vec>
+gather_term(const char*, const T_vec&, const std::vector<int>&)
+    -> gather_term<T_vec>;
+
+/** \ingroup prob_dists
+ * Leaf tag: a data-slope term `coef * xd[n]` of the additive predictor, with
+ * `coef` a scalar var and `xd` a contiguous data vector
+ * (`std::vector<double>` or an Eigen vector). This is the composed-path
+ * `rvalue(beta, index_uni(k)) * rvalue(xd, index_uni(n))`.
+ */
+template <typename T_coef, typename T_d>
+struct slope_term {
+  const T_coef& coef;
+  const T_d& xd;
+};
+template <typename T_coef, typename T_d>
+slope_term(const T_coef&, const T_d&) -> slope_term<T_coef, T_d>;
+
+/** \ingroup prob_dists
+ * Leaf tag: a chained data-slope term `(coef * xd1[n]) * xd2[n]` of the
+ * additive predictor (the composed `beta[5] * female[i] * black[i]` form:
+ * two rounded products, left-associated).
+ */
+template <typename T_coef, typename T_d1, typename T_d2>
+struct slope2_term {
+  const T_coef& coef;
+  const T_d1& xd1;
+  const T_d2& xd2;
+};
+template <typename T_coef, typename T_d1, typename T_d2>
+slope2_term(const T_coef&, const T_d1&, const T_d2&)
+    -> slope2_term<T_coef, T_d1, T_d2>;
+
+namespace internal {
+
+// Resolved (forward-value + reverse-route) form of a `gather_term`. The
+// adjoint routes follow the composed path: SoA (`var_value<>`) coefficient
+// vectors scatter into the matrix vari's adjoint array (the rvalue view's
+// pure adds), AoS vectors into one `vari*` per coefficient element.
+template <typename T_vec>
+struct resolved_gather {
+  static constexpr bool is_soa = is_var_v<std::decay_t<T_vec>>;
+  using soa_vec_vari = vari_value<Eigen::Matrix<double, Eigen::Dynamic, 1>>;
+  using vari_vec = Eigen::Matrix<vari*, Eigen::Dynamic, 1>;
+
+  const char* name_;
+  Eigen::Index csize_;
+  const int* idx1_;  // 1-based indices, observation-ordered (leaf data)
+  Eigen::Matrix<double, Eigen::Dynamic, 1> vals_;
+  [[maybe_unused]] soa_vec_vari* vi_soa_ = nullptr;
+  [[maybe_unused]] arena_t<vari_vec> vi_aos_{0};
+
+  template <typename T>
+  explicit resolved_gather(const gather_term<T>& leaf)
+      : name_(leaf.name),
+        csize_(leaf.coefs.size()),
+        idx1_(leaf.idx.data()),
+        vals_(value_of(leaf.coefs)) {
+    if constexpr (is_soa) {
+      vi_soa_ = leaf.coefs.vi_;
+    } else {
+      vi_aos_ = arena_t<vari_vec>(csize_);
+      for (Eigen::Index j = 0; j < csize_; ++j) {
+        vi_aos_.coeffRef(j) = leaf.coefs.coeff(j).vi_;
+      }
+    }
+  }
+
+  // Stock per-element order: rvalue's check_range then the coefficient read.
+  inline double fwd(Eigen::Index k) const {
+    const int one_based = idx1_[k];
+    if (unlikely(one_based < 1 || one_based > csize_)) {
+      check_range("vector[uni] indexing", name_, csize_, one_based);
+    }
+    return vals_.coeff(one_based - 1);
+  }
+
+  inline void rev(Eigen::Index k, double e) const {
+    const Eigen::Index ik = idx1_[k] - 1;
+    if constexpr (is_soa) {
+      vi_soa_->adj_.coeffRef(ik) += e;
+    } else {
+      vi_aos_.coeff(ik)->adj_ += e;
+    }
+  }
+};
+
+// Resolved `slope_term`: one scalar-var coefficient, one data vector.
+struct resolved_slope {
+  vari* coef_vi_;
+  double coef_val_;
+  const double* xd_;
+
+  template <typename T_coef, typename T_d>
+  explicit resolved_slope(const slope_term<T_coef, T_d>& leaf)
+      : coef_vi_(leaf.coef.vi_),
+        coef_val_(leaf.coef.vi_->val_),
+        xd_(leaf.xd.data()) {}
+
+  // Stock: multiply_vd_vari's vmulsd, one rounded product. The volatile
+  // barrier materializes the rounding so the caller's accumulation add
+  // cannot be contracted into an fma with this product (stock's adds are
+  // pure vaddsd's over already-rounded products).
+  inline double fwd(Eigen::Index k) const {
+    volatile const double p = coef_val_ * xd_[k];
+    return p;
+  }
+
+  // Stock: multiply_vd_vari::chain()'s vfmadd132sd (adj_ += adj_*bd_),
+  // fused at the model flags.
+  inline void rev(Eigen::Index k, double e) const { coef_vi_->adj_ += xd_[k] * e; }
+};
+
+// Resolved `slope2_term`: one scalar-var coefficient, two chained data
+// vectors ((coef*xd1)*xd2).
+struct resolved_slope2 {
+  vari* coef_vi_;
+  double coef_val_;
+  const double* xd1_;
+  const double* xd2_;
+
+  template <typename T_coef, typename T_d1, typename T_d2>
+  explicit resolved_slope2(const slope2_term<T_coef, T_d1, T_d2>& leaf)
+      : coef_vi_(leaf.coef.vi_),
+        coef_val_(leaf.coef.vi_->val_),
+        xd1_(leaf.xd1.data()),
+        xd2_(leaf.xd2.data()) {}
+
+  // Stock: two vmulsd's, left-associated ((coef*xd1)*xd2), each rounded
+  // (barriers block any contraction into the caller's adds or across the
+  // two products).
+  inline double fwd(Eigen::Index k) const {
+    volatile const double p1 = coef_val_ * xd1_[k];
+    volatile const double p2 = p1 * xd2_[k];
+    return p2;
+  }
+
+  // Stock reverse (m2's chain then m1's chain): m2 applies a vfmadd into its
+  // operand's zero-initialized adjoint (= one rounded product e*xd2), then
+  // m1 applies a fused vfmadd of that product by xd1 into the coefficient
+  // adjoint. The volatile barrier forces the intermediate rounding.
+  inline void rev(Eigen::Index k, double e) const {
+    volatile const double t = e * xd2_[k];
+    coef_vi_->adj_ += xd1_[k] * t;
+  }
+};
+
+// Resolve a leaf tag to its forward/reverse state.
+template <typename T_vec>
+inline auto resolve_leaf(const gather_term<T_vec>& leaf, Eigen::Index = 0) {
+  static_assert(is_var_v<std::decay_t<T_vec>> ||
+                    is_eigen_v<std::decay_t<T_vec>>,
+                "gather_term coefficient vectors must be vectors of vars");
+  return resolved_gather<T_vec>(leaf);
+}
+
+template <typename T_coef, typename T_d>
+inline auto resolve_leaf(const slope_term<T_coef, T_d>& leaf, Eigen::Index = 0) {
+  static_assert(is_var_v<std::decay_t<T_coef>>,
+                "slope_term coefficients must be vars");
+  return resolved_slope(leaf);
+}
+
+template <typename T_coef, typename T_d1, typename T_d2>
+inline auto resolve_leaf(const slope2_term<T_coef, T_d1, T_d2>& leaf,
+                         Eigen::Index = 0) {
+  static_assert(is_var_v<std::decay_t<T_coef>>,
+                "slope2_term coefficients must be vars");
+  return resolved_slope2(leaf);
+}
+
+// Per-leaf size checks (the composed path's y_hat always matches n by
+// construction, so these are API-level guards).
+template <typename T_vec>
+inline void check_leaf_size(const char* function, Eigen::Index n_obs,
+                            const gather_term<T_vec>& leaf) {
+  check_size_match(function, "Random variable size", n_obs,
+                   "Index vector size",
+                   static_cast<Eigen::Index>(leaf.idx.size()));
+}
+
+template <typename T_coef, typename T_d>
+inline void check_leaf_size(const char* function, Eigen::Index n_obs,
+                            const slope_term<T_coef, T_d>& leaf) {
+  check_size_match(function, "Random variable size", n_obs,
+                   "Data vector size",
+                   static_cast<Eigen::Index>(leaf.xd.size()));
+}
+
+template <typename T_coef, typename T_d1, typename T_d2>
+inline void check_leaf_size(const char* function, Eigen::Index n_obs,
+                            const slope2_term<T_coef, T_d1, T_d2>& leaf) {
+  check_size_match(function, "Random variable size", n_obs,
+                   "Data vector size",
+                   static_cast<Eigen::Index>(leaf.xd1.size()));
+  check_size_match(function, "Random variable size", n_obs,
+                   "Data vector size",
+                   static_cast<Eigen::Index>(leaf.xd2.size()));
+}
+
+// Reverse pass over the resolved-leaf tuple in REVERSE declaration order:
+// the composed path's per-element varis are swept in reverse creation
+// order, so within each element the LAST-declared leaf's increment lands
+// first.
+template <std::size_t I = 0, typename Tuple>
+inline void rev_leaves(const Tuple& leaves, Eigen::Index k, double e) {
+  if constexpr (I < std::tuple_size_v<std::decay_t<Tuple>>) {
+    rev_leaves<I + 1>(leaves, k, e);
+    std::get<I>(leaves).rev(k, e);
+  }
+}
+
+}  // namespace internal
+
+/** \ingroup prob_dists
+ * Additive multi-gather Bernoulli-logit likelihood: the log PMF of the
+ * logit-parametrized Bernoulli distribution over the index/data-assembled
+ * linear predictor
+ *
+ *   eta[n] = intercept + sum_t prod_j xd_tj[n] * coef_t
+ *          + sum_k coefs_k[idx_k[n]]
+ *
+ * built from `slope_term` / `slope2_term` / `gather_term` leaves, WITHOUT
+ * materializing the per-observation predictor as autodiff intermediates.
+ * This is the pattern behind the election88-class model
+ *
+ *   y ~ bernoulli_logit(beta[1] + beta[2]*black + beta[3]*female
+ *                       + beta[5]*female*black + beta[4]*v_prev
+ *                       + a[age] + b[edu] + c[age_edu] + d[state]
+ *                       + e[region_full]);
+ *
+ * (there written through a transformed parameter, whose own chain this
+ * primitive does not replace: call it from the likelihood statement with the
+ * gathered operands directly and leave the transformed-parameter loop as the
+ * compiler wrote it; that loop's adjoints stay zero and its values stay
+ * available for output columns).
+ *
+ * The value path performs exactly the same floating point operations, in the
+ * same per-element order, as the composed scalar expression the compiler
+ * generates for that model: per element, each data-product leaf evaluates
+ * its rounded product chain (vmulsd; left-associated for slope2), and the
+ * terms are summed left-to-right with pure rounded adds over already-rounded
+ * products (vaddsd; the `volatile` barriers in the leaf forward paths block
+ * GCC's fp-contraction from fusing an accumulation add with a leaf product).
+ * The interior is the `bernoulli_logit_lpmf` expression verbatim (signs,
+ * `ntheta`, `exp(-ntheta)`, the two nested `Select` trees, Eigen's `sum`
+ * redux).
+ *
+ * The reverse pass is ONE callback vari replicating the machine-code schedule
+ * of the composed path (W-127 disassembly of the stock model at
+ * `-O3 -mavx2 -mfma`): the likelihood edge applies its partial as one
+ * multiply-add per element, the transformed-parameter expression's scalar
+ * varis are swept in reverse creation order (elements DESCENDING, and within
+ * each element the leaves in REVERSE declaration order), gathered terms
+ * arrive through pure adds, single-product terms through a FUSED multiply-add
+ * (`multiply_vd_vari::chain`'s vfmadd132sd), and two-product terms through a
+ * rounded intermediate product then a fused multiply-add:
+ *
+ *   e                 = round(w * dtheta[k])         [the edge application]
+ *   coefs_k[idx]_adj += e                            [pure add]
+ *   coef_t_adj        = fma(xd_t[k], e, coef_t_adj)  [fused]
+ *   t                 = round(e * xd2[k])            [m2 chain, one rounding]
+ *   coef_adj          = fma(xd1[k], t, coef_adj)     [m1 chain, fused]
+ *   intercept_adj     += e                            [pure add, first operand]
+ *
+ * with `w` the adjoint of the returned log probability and `dtheta` the
+ * elementwise partial of `bernoulli_logit_lpmf` (branch behavior at
+ * `|ntheta| > 20` preserved). Values and every gradient component are
+ * bit-identical to the composed stock path in every operand layout the stanc
+ * deserializer produces (`Matrix<var>`, `var_value<Matrix<double>>`,
+ * `Map<const Matrix<var>>`).
+ *
+ * Checks mirror stock's `bernoulli_logit_lpmf` (same function name in
+ * messages: `check_bounded` on `n`, `check_not_nan` on the assembled
+ * predictor) and stock's `rvalue` range checks on every gathered index
+ * ("vector[uni] indexing", in the composed path's per-element leaf order).
+ *
+ * @tparam propto if `true`, normalize out constant terms (there are none for
+ * this distribution)
+ * @tparam T_n type of the random variable (integer vector-like)
+ * @tparam T_intercept scalar var type of the intercept term
+ * @tparam Leaves zero or more `gather_term` / `slope_term` / `slope2_term`
+ * leaves, in the composed expression's declaration order
+ * @param n random variable (0 or 1), one entry per observation
+ * @param intercept scalar var intercept of the predictor
+ * @param leaves the predictor's product and gathered terms
+ * @return var holding the log probability mass
+ * @throw std::domain_error if any assembled predictor value is NaN
+ * @throw std::invalid_argument if the container sizes mismatch
+ * @throw std::out_of_range if a gathered index is out of range
+ */
+template <bool propto, typename T_n, typename T_intercept, typename... Leaves,
+          require_st_var<T_intercept>* = nullptr,
+          require_vector_like_vt<std::is_integral, T_n>* = nullptr>
+inline var bernoulli_logit_lpmf_gathered_additive(
+    const T_n& n, const T_intercept& intercept, const Leaves&... leaves) {
+  using T_partials_array = Eigen::Array<double, Eigen::Dynamic, 1>;
+  using std::exp;
+  static constexpr const char* function = "bernoulli_logit_lpmf";
+
+  const Eigen::Index n_obs = stan::math::size(n);
+  ((internal::check_leaf_size(function, n_obs, leaves)), ...);
+  if (unlikely(n_obs == 0 || size_zero(n))) {
+    return var(0.0);
+  }
+  check_bounded(function, "n", n, 0, 1);
+
+  vari* intercept_vi = intercept.vi_;
+  const double intercept_val = intercept.vi_->val_;
+
+  // Resolve every leaf's routes (adjoint targets + forward values).
+  const auto leaves_resolved
+      = std::tuple(internal::resolve_leaf(leaves, n_obs)...);
+
+  // Per-observation predictor in the composed path's exact op order:
+  // left-associated sum over already-rounded leaf values.
+  arena_t<T_partials_array> eta(n_obs);
+  for (Eigen::Index k = 0; k < n_obs; ++k) {
+    double t = intercept_val;
+    std::apply(
+        [&t, k](const auto&... ls) { ((t = t + ls.fwd(k)), ...); },
+        leaves_resolved);
+    eta.coeffRef(k) = t;
+  }
+  check_not_nan(function, "Logit transformed probability parameter", eta);
+  if constexpr (!include_summand<propto, T_intercept>::value) {
+    return var(0.0);
+  }
+
+  // ---- bernoulli_logit_lpmf interior, verbatim (as in the 2PL overload) ----
+  const auto& n_col = as_column_vector_or_scalar(n);
+  const auto& n_double = value_of_rec(n_col);
+  auto signs = to_ref(2 * as_array_or_scalar(n_double) - 1);
+  T_partials_array ntheta = signs * eta;
+
+  T_partials_array exp_m_ntheta = exp(-ntheta);
+  static constexpr double cutoff = 20.0;
+  double logp = sum(
+      (ntheta > cutoff)
+          .select(-exp_m_ntheta,
+                  (ntheta < -cutoff).select(ntheta, -log1p(exp_m_ntheta))));
+
+  arena_t<T_partials_array> dtheta =
+      (ntheta > cutoff)
+          .select(-exp_m_ntheta,
+                  (ntheta >= -cutoff)
+                      .select(promote_scalar<double>(
+                                  signs * exp_m_ntheta / (exp_m_ntheta + 1)),
+                              promote_scalar<double>(signs)));
+  // ---- end of interior ------------------------------------------------------
+
+  return make_callback_var(
+      logp,
+      [intercept_vi, leaves_resolved, dtheta](const auto& vi) {
+        const double w = vi.adj_;
+        // Elements DESCENDING, leaves in reverse declaration order: the
+        // composed path's scalar varis are swept from the stack top down.
+        for (Eigen::Index k = dtheta.size() - 1; k >= 0; --k) {
+          const double e = w * dtheta.coeff(k);
+          internal::rev_leaves(leaves_resolved, k, e);
+          intercept_vi->adj_ += e;
+        }
+      });
+}
+
+/** \ingroup prob_dists
+ * Additive multi-gather likelihood (see the propto overload). Drops constant
+ * terms; there are none for this distribution, so this matches
+ * `bernoulli_logit_lpmf_gathered_additive<true>` exactly.
+ */
+template <typename T_n, typename T_intercept, typename... Leaves,
+          require_st_var<T_intercept>* = nullptr,
+          require_vector_like_vt<std::is_integral, T_n>* = nullptr>
+inline var bernoulli_logit_lpmf_gathered_additive(
+    const T_n& n, const T_intercept& intercept, const Leaves&... leaves) {
+  return bernoulli_logit_lpmf_gathered_additive<true>(n, intercept, leaves...);
+}
+
 }  // namespace math
 }  // namespace stan
 #endif
