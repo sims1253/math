@@ -15,6 +15,8 @@
 #include <stan/math/prim/fun/value_of.hpp>
 #include <stan/math/prim/fun/value_of_rec.hpp>
 #include <stan/math/rev/core.hpp>
+
+#include <new>
 #include <stan/math/rev/meta/is_rev_matrix.hpp>
 
 namespace stan {
@@ -798,6 +800,460 @@ inline var bernoulli_logit_lpmf_gathered_additive_tp(
     const T_intercept& intercept, const Leaves&... leaves) {
   return internal::additive_impl<true, false>(n, &adjoint_target, intercept,
                                               leaves...);
+}
+
+// ---------------------------------------------------------------------------
+// TP-block custom vari (W-130): the per-element custom-vari construction for
+// additive gathered predictors BUILT IN A TRANSFORMED-PARAMETERS LOOP, with
+// the likelihood line left fully stock. This closes the W-129 finding: the
+// bit-identity dimension for tp-built predictors is the DELIVERY POSITION of
+// the likelihood's increments (stock delivers them through varis created in
+// the transformed-parameters block — the earliest stack frames, swept LAST,
+// after every prior edge; any likelihood-site callback is swept BEFORE the
+// priors that precede it). Constructing the per-element vari AT THE TP LOOP
+// restores stock's position by construction while collapsing ~24 varis per
+// element (views, callbacks, products, adds) into ONE.
+// ---------------------------------------------------------------------------
+
+/** \ingroup prob_dists
+ * Leaf tag: a bare coefficient-slot term `coefs[slot]` of the additive
+ * predictor's leading operand (the `beta[1]` of the election88 class), for
+ * the tp-block custom-vari factory `gathered_additive_tp`. `coefs` is the
+ * whole coefficient vector (`var_value<Matrix<double>>` for the SoA
+ * deserializer layout, `Eigen::Matrix<var>` / `Map<const Matrix<var>>` for
+ * AoS layouts) and `slot` is the 1-based index the composed expression
+ * reads. Routing the VECTOR (not an `rvalue` view of it) is what lets the
+ * factory reach the SoA matrix vari's adjoint slot directly — the exact
+ * destination stock's per-element `rvalue` view callbacks write into.
+ */
+template <typename T_vec>
+struct slot_term {
+  const char* name;
+  const T_vec& coefs;
+  int slot;
+  slot_term(const char* name, const T_vec& coefs, int slot)
+      : name(name), coefs(coefs), slot(slot) {}
+};
+template <typename T_vec>
+slot_term(const char*, const T_vec&, int) -> slot_term<T_vec>;
+
+/** \ingroup prob_dists
+ * Leaf tag: a data-slope term `coefs[slot] * xd[n]` for the tp-block
+ * custom-vari factory (see `slot_term`; this is the slot-routed form of
+ * `slope_term`).
+ */
+template <typename T_vec, typename T_d>
+struct slot_slope_term {
+  const char* name;
+  const T_vec& coefs;
+  int slot;
+  const T_d& xd;
+  slot_slope_term(const char* name, const T_vec& coefs, int slot,
+                  const T_d& xd)
+      : name(name), coefs(coefs), slot(slot), xd(xd) {}
+};
+template <typename T_vec, typename T_d>
+slot_slope_term(const char*, const T_vec&, int, const T_d&)
+    -> slot_slope_term<T_vec, T_d>;
+
+/** \ingroup prob_dists
+ * Leaf tag: a chained data-slope term `(coefs[slot] * xd1[n]) * xd2[n]` for
+ * the tp-block custom-vari factory (the slot-routed form of `slope2_term`).
+ */
+template <typename T_vec, typename T_d1, typename T_d2>
+struct slot_slope2_term {
+  const char* name;
+  const T_vec& coefs;
+  int slot;
+  const T_d1& xd1;
+  const T_d2& xd2;
+  slot_slope2_term(const char* name, const T_vec& coefs, int slot,
+                   const T_d1& xd1, const T_d2& xd2)
+      : name(name), coefs(coefs), slot(slot), xd1(xd1), xd2(xd2) {}
+};
+template <typename T_vec, typename T_d1, typename T_d2>
+slot_slope2_term(const char*, const T_vec&, int, const T_d1&, const T_d2&)
+    -> slot_slope2_term<T_vec, T_d1, T_d2>;
+
+namespace internal {
+
+// Resolved `slot_term` (the intercept). Both routes deliver a PURE ADD of the
+// exact per-element adjoint increment: stock's leading operand is a direct
+// add operand of the sum's first `operator+` (AoS alias) or a per-element
+// rvalue view whose callback adds the exact view adjoint into the SoA slot.
+template <typename T_vec>
+struct resolved_slot_intercept {
+  static constexpr bool is_soa = is_var_v<std::decay_t<T_vec>>;
+  using soa_vec_vari = vari_value<Eigen::Matrix<double, Eigen::Dynamic, 1>>;
+  double val_;
+  [[maybe_unused]] soa_vec_vari* vi_soa_ = nullptr;
+  [[maybe_unused]] Eigen::Index slot_ = 0;
+  [[maybe_unused]] vari* vi_ = nullptr;
+
+  explicit resolved_slot_intercept(const slot_term<T_vec>& leaf)
+      : val_(0.0) {
+    if constexpr (is_soa) {
+      vi_soa_ = leaf.coefs.vi_;
+      slot_ = leaf.slot - 1;
+      val_ = vi_soa_->val_.coeff(slot_);
+    } else {
+      vi_ = leaf.coefs.coeff(leaf.slot - 1).vi_;
+      val_ = vi_->val_;
+    }
+  }
+
+  inline void rev(double e) const {
+    if constexpr (is_soa) {
+      vi_soa_->adj_.coeffRef(slot_) += e;
+    } else {
+      vi_->adj_ += e;
+    }
+  }
+};
+
+// Resolved plain-var intercept (a free `var` operand — the AoS semantics:
+// its own vari is a direct add operand, so the increment is a pure add).
+struct resolved_var_intercept {
+  vari* vi_;
+  double val_;
+  explicit resolved_var_intercept(vari* vi) : vi_(vi), val_(vi->val_) {}
+  inline void rev(double e) const { vi_->adj_ += e; }
+};
+
+template <typename T_vec>
+inline auto resolve_intercept(const slot_term<T_vec>& intercept) {
+  static_assert(is_var_v<std::decay_t<T_vec>> ||
+                    is_eigen_v<std::decay_t<T_vec>>,
+                "slot_term coefficient vectors must be vectors of vars");
+  // stock's rvalue range check text (a defensive API guard: slots are
+  // compile-time constants in the emitted call and never out of range).
+  if (unlikely(intercept.slot < 1
+               || intercept.slot > static_cast<int>(intercept.coefs.size()))) {
+    check_range("vector[uni] indexing", intercept.name,
+                intercept.coefs.size(), intercept.slot);
+  }
+  return resolved_slot_intercept<T_vec>(intercept);
+}
+
+template <typename T_intercept, require_st_var<T_intercept>* = nullptr>
+inline auto resolve_intercept(const T_intercept& intercept) {
+  return resolved_var_intercept(intercept.vi_);
+}
+
+// Resolved `slot_slope_term`. The two routes carry DIFFERENT per-element
+// adjoint arithmetic, each matching what stock's composed path does for that
+// operand layout:
+//  - SoA (`var_value<>`): stock's per-element `rvalue` creates a fresh view
+//    vari whose `multiply_vd_vari::chain` applies ONE ROUNDED PRODUCT (a
+//    fused multiply-add into the view's zero adjoint), and the view's
+//    callback then adds that product into the matrix slot with a PURE ADD —
+//    the W-108.1 SoA schedule (rounded product + unfused add).
+//  - AoS / Map: `rvalue` aliases the coefficient's own vari, so the chain's
+//    fused multiply-add accumulates DIRECTLY into the shared adjoint (the
+//    W-127-certified single-expression form).
+template <typename T_vec>
+struct resolved_slot_slope {
+  static constexpr bool is_soa = is_var_v<std::decay_t<T_vec>>;
+  using soa_vec_vari = vari_value<Eigen::Matrix<double, Eigen::Dynamic, 1>>;
+  double coef_val_;
+  const double* xd_;
+  [[maybe_unused]] soa_vec_vari* vi_soa_ = nullptr;
+  [[maybe_unused]] Eigen::Index slot_ = 0;
+  [[maybe_unused]] vari* coef_vi_ = nullptr;
+
+  template <typename T_d>
+  resolved_slot_slope(const slot_slope_term<T_vec, T_d>& leaf)
+      : xd_(leaf.xd.data()) {
+    if constexpr (is_soa) {
+      vi_soa_ = leaf.coefs.vi_;
+      slot_ = leaf.slot - 1;
+      coef_val_ = vi_soa_->val_.coeff(slot_);
+    } else {
+      coef_vi_ = leaf.coefs.coeff(leaf.slot - 1).vi_;
+      coef_val_ = coef_vi_->val_;
+    }
+  }
+
+  // Stock forward: multiply_vd_vari's vmulsd (one rounded product; the
+  // barrier keeps the caller's accumulation add from contracting with it).
+  inline double fwd(Eigen::Index k) const {
+    volatile const double p = coef_val_ * xd_[k];
+    return p;
+  }
+
+  inline void rev(Eigen::Index k, double e) const {
+    if constexpr (is_soa) {
+      // rounded product + PURE add into the slot (stock's view callback).
+      // The 1.0-multiplier alias class needs no branch on this route:
+      // RN(1.0 * e) == e exactly, matching stock's aliased pure add.
+      volatile const double inc = xd_[k] * e;
+      vi_soa_->adj_.coeffRef(slot_) += inc;
+    } else {
+      // stock's chain accumulating into the shared vari: FUSED (one
+      // rounding of product + adjoint), as decoded and certified in W-127.
+      coef_vi_->adj_ += xd_[k] * e;
+    }
+  }
+};
+
+// Resolved `slot_slope2_term`: `(coefs[slot] * xd1) * xd2`.
+//  - SoA route: stock's two chains each apply a rounded product into a fresh
+//    zero adjoint (m2: RN(e*xd2), then m1: RN(xd1 * RN(e*xd2))), and the view
+//    callback adds the final product into the slot with a PURE ADD. The
+//    1.0-multiplier alias classes are covered by the generic path exactly
+//    (multiplication by 1.0 is exact), so no branch is needed.
+//  - AoS / Map route: the W-127-certified aliased-branch form accumulating
+//    into the shared vari (see `resolved_slope2::rev`).
+template <typename T_vec>
+struct resolved_slot_slope2 {
+  static constexpr bool is_soa = is_var_v<std::decay_t<T_vec>>;
+  using soa_vec_vari = vari_value<Eigen::Matrix<double, Eigen::Dynamic, 1>>;
+  double coef_val_;
+  const double* xd1_;
+  const double* xd2_;
+  [[maybe_unused]] soa_vec_vari* vi_soa_ = nullptr;
+  [[maybe_unused]] Eigen::Index slot_ = 0;
+  [[maybe_unused]] vari* coef_vi_ = nullptr;
+
+  template <typename T_d1, typename T_d2>
+  resolved_slot_slope2(const slot_slope2_term<T_vec, T_d1, T_d2>& leaf)
+      : xd1_(leaf.xd1.data()), xd2_(leaf.xd2.data()) {
+    if constexpr (is_soa) {
+      vi_soa_ = leaf.coefs.vi_;
+      slot_ = leaf.slot - 1;
+      coef_val_ = vi_soa_->val_.coeff(slot_);
+    } else {
+      coef_vi_ = leaf.coefs.coeff(leaf.slot - 1).vi_;
+      coef_val_ = coef_vi_->val_;
+    }
+  }
+
+  // Stock forward: two vmulsd's, left-associated, each rounded.
+  inline double fwd(Eigen::Index k) const {
+    volatile const double p1 = coef_val_ * xd1_[k];
+    volatile const double p2 = p1 * xd2_[k];
+    return p2;
+  }
+
+  inline void rev(Eigen::Index k, double e) const {
+    if constexpr (is_soa) {
+      // m2's rounded product, m1's rounded product, then the callback's
+      // PURE add into the slot (two roundings + the add; the barriers block
+      // any contraction).
+      volatile const double t = e * xd2_[k];
+      volatile const double p = xd1_[k] * t;
+      vi_soa_->adj_.coeffRef(slot_) += p;
+    } else {
+      if (xd1_[k] == 1.0) {
+        coef_vi_->adj_ += xd2_[k] * e;
+        return;
+      }
+      volatile const double ev = e;
+      volatile const double t = ev * xd2_[k];
+      coef_vi_->adj_ += xd1_[k] * t;
+    }
+  }
+};
+
+template <typename T_vec>
+inline auto resolve_leaf(const slot_term<T_vec>& leaf, Eigen::Index = 0) {
+  static_assert(is_var_v<std::decay_t<T_vec>> ||
+                    is_eigen_v<std::decay_t<T_vec>>,
+                "slot_term coefficient vectors must be vectors of vars");
+  return resolved_slot_intercept<T_vec>(leaf);
+}
+
+template <typename T_vec, typename T_d>
+inline auto resolve_leaf(const slot_slope_term<T_vec, T_d>& leaf,
+                         Eigen::Index = 0) {
+  static_assert(is_var_v<std::decay_t<T_vec>> ||
+                    is_eigen_v<std::decay_t<T_vec>>,
+                "slot_slope_term coefficient vectors must be vectors of vars");
+  if (unlikely(leaf.slot < 1
+               || leaf.slot > static_cast<int>(leaf.coefs.size()))) {
+    check_range("vector[uni] indexing", leaf.name, leaf.coefs.size(),
+                leaf.slot);
+  }
+  return resolved_slot_slope<T_vec>(leaf);
+}
+
+template <typename T_vec, typename T_d1, typename T_d2>
+inline auto resolve_leaf(const slot_slope2_term<T_vec, T_d1, T_d2>& leaf,
+                         Eigen::Index = 0) {
+  static_assert(is_var_v<std::decay_t<T_vec>> ||
+                    is_eigen_v<std::decay_t<T_vec>>,
+                "slot_slope2_term coefficient vectors must be vectors of vars");
+  if (unlikely(leaf.slot < 1
+               || leaf.slot > static_cast<int>(leaf.coefs.size()))) {
+    check_range("vector[uni] indexing", leaf.name, leaf.coefs.size(),
+                leaf.slot);
+  }
+  return resolved_slot_slope2<T_vec>(leaf);
+}
+
+// Per-leaf size checks for the slot tags (API-level guards; the composed
+// path's data rvalue range checks can never fire in a well-formed model,
+// where every data vector's size equals the loop bound by construction).
+template <typename T_vec>
+inline void check_leaf_size(const char*, Eigen::Index,
+                            const slot_term<T_vec>&) {}
+
+template <typename T_vec, typename T_d>
+inline void check_leaf_size(const char* function, Eigen::Index n_obs,
+                            const slot_slope_term<T_vec, T_d>& leaf) {
+  check_size_match(function, "Random variable size", n_obs,
+                   "Data vector size",
+                   static_cast<Eigen::Index>(leaf.xd.size()));
+}
+
+template <typename T_vec, typename T_d1, typename T_d2>
+inline void check_leaf_size(const char* function, Eigen::Index n_obs,
+                            const slot_slope2_term<T_vec, T_d1, T_d2>& leaf) {
+  check_size_match(function, "Random variable size", n_obs,
+                   "Data vector size",
+                   static_cast<Eigen::Index>(leaf.xd1.size()));
+  check_size_match(function, "Random variable size", n_obs,
+                   "Data vector size",
+                   static_cast<Eigen::Index>(leaf.xd2.size()));
+}
+
+// Shared per-call state for the tp-block varis: the intercept route, every
+// leaf's resolved route, and nothing else. Arena-allocated once per factory
+// call and referenced by pointer from each per-element vari (never
+// destructed — recovered with the arena; the resolved gathers' heap value
+// buffers are released never, the documented `make_callback_var` capture
+// discipline).
+template <typename T_intercept, typename LeafTuple>
+struct additive_tp_state {
+  T_intercept intercept_;
+  LeafTuple leaves_;
+};
+
+// The per-element tp-block vari. Pushed on the var_stack AT THE FACTORY CALL
+// (the transformed-parameters block — before the model block's prior and
+// likelihood callbacks), hence swept LAST, elements DESCENDING: stock's
+// delivery position for a tp-built predictor. The stock likelihood's edge
+// application writes its partial into adj_ exactly as it writes into stock's
+// top add-vari adjoint (one fused multiply-add per element over a
+// zero-initialized adjoint, elements ascending — the value stock's chain
+// head receives); chain() then replays the element's certified backward.
+template <typename T_intercept, typename LeafTuple>
+class additive_tp_vari : public vari {
+  additive_tp_state<T_intercept, LeafTuple>* state_;
+  Eigen::Index k_;
+
+ public:
+  additive_tp_vari(double eta, additive_tp_state<T_intercept, LeafTuple>* state,
+                   Eigen::Index k)
+      : vari(eta), state_(state), k_(k) {}
+
+  inline void chain() final {
+    const double e = adj_;
+    internal::rev_leaves(state_->leaves_, k_, e);
+    state_->intercept_.rev(e);
+  }
+};
+
+}  // namespace internal
+
+/** \ingroup prob_dists
+ * TP-block custom-vari construction for the additive multi-gather predictor:
+ * builds `vector[n_obs] y_hat` such that EACH element is ONE custom vari
+ * CREATED AT THE TRANSFORMED-PARAMETERS LOOP, with
+ *
+ *   y_hat[n] = intercept + sum_t prod_j xd_tj[n] * coef_t
+ *            + sum_k coefs_k[idx_k[n]]
+ *
+ * computed in double space in the composed stock expression's exact op order
+ * (rounded leaf products — `vmulsd`, left-associated for slope2 — summed
+ * left-to-right with pure adds; the values are the W-129-validated
+ * value-only path, bitwise the composed loop's), while the LIKELIHOOD LINE
+ * STAYS STOCK (`bernoulli_logit_lpmf(y, y_hat)` over the returned var
+ * vector: its edge application writes the per-element partial into the
+ * custom varis' adjoints exactly as it writes into stock's per-element
+ * top-of-chain varis — the same compiled edge code over the same
+ * `vari_value<double>` adjoint layout).
+ *
+ * The reverse pass replays, per element, the exact arithmetic stock's
+ * transformed-parameter chains + likelihood edge perform for that element
+ * (the W-127-certified schedule; elements DESCENDING, leaves in REVERSE
+ * declaration order, intercept last):
+ *
+ *  - gathered leaves: a PURE ADD of the exact per-element increment into the
+ *    coefficient's adjoint slot (SoA) or vari adjoint (AoS);
+ *  - slope leaves: for AoS/Map-routed coefficients a FUSED multiply-add
+ *    into the shared vari adjoint (stock's `multiply_vd_vari::chain`
+ *    accumulating through its aliased operand); for SoA-routed coefficients
+ *    (`slot_*` tags over `var_value<>`) ONE ROUNDED PRODUCT then a PURE ADD
+ *    into the matrix adjoint slot — stock's per-element view-callback
+ *    schedule (W-108.1's SoA discipline; the `operator*` 1.0-alias classes
+ *    are exact on this route, since RN(1.0 * e) == e);
+ *  - slope2 leaves: two rounded products then a pure slot add (SoA), or the
+ *    certified rounded-intermediate + fused multiply-add with the aliased
+ *    1.0-multiplier branch (AoS);
+ *  - the intercept: a pure add of the exact increment, LAST within the
+ *    element.
+ *
+ * Because the varis are created at the transformed-parameters block, the
+ * sweep applies them AFTER every prior edge regardless of where the
+ * likelihood statement sits — stock's fold — so this construction is
+ * bit-identical to the fully-stock composed path for tp-built predictors in
+ * EVERY model-block layout (priors before OR after the likelihood). This is
+ * the W-129 "bit-identity lane": same elimination class as the scatter
+ * rewrite (the ~24-varis-per-element tp chain complex collapses to one
+ * vari) with delivery at stock's position by construction.
+ *
+ * Checks: the gathered leaves' range checks fire HERE, in the composed
+ * per-element leaf order (stock's transformed-parameter loop position —
+ * before the priors and the likelihood's own checks); the predictor's
+ * `check_not_nan` and the random variable's `check_bounded` remain the stock
+ * likelihood's (firing at the likelihood statement, over bit-identical
+ * values). The slot range checks mirror `rvalue`'s text as API guards
+ * (never fire in the emitted call: slots are constants).
+ *
+ * @tparam T_intercept the intercept: a scalar var (plain/AoS semantics) or a
+ * `slot_term` view of a coefficient vector
+ * @tparam Leaves zero or more `slot_slope_term` / `slot_slope2_term` /
+ * `gather_term` (and, for AoS-aliased operands, `slope_term` /
+ * `slope2_term`) leaves, in the composed expression's declaration order
+ * @param n_obs the predictor's length (the model's loop bound)
+ * @param intercept the predictor's leading coefficient term
+ * @param leaves the predictor's product and gathered terms
+ * @return `y_hat` as a vector of vars, one custom vari per element
+ * @throw std::out_of_range if a gathered index (or, defensively, a slot) is
+ * out of range, with stock's message texts
+ */
+template <typename T_intercept, typename... Leaves>
+inline Eigen::Matrix<var, Eigen::Dynamic, 1> gathered_additive_tp(
+    Eigen::Index n_obs, const T_intercept& intercept, const Leaves&... leaves) {
+  [[maybe_unused]] static constexpr const char* function
+      = "gathered_additive_tp";
+  ((internal::check_leaf_size(function, n_obs, leaves)), ...);
+  Eigen::Matrix<var, Eigen::Dynamic, 1> y_hat(n_obs);
+  if (unlikely(n_obs == 0)) {
+    return y_hat;
+  }
+  const auto intercept_resolved = internal::resolve_intercept(intercept);
+  const auto leaves_resolved
+      = std::tuple(internal::resolve_leaf(leaves, n_obs)...);
+  using state_t = internal::additive_tp_state<
+      std::decay_t<decltype(intercept_resolved)>,
+      std::decay_t<decltype(leaves_resolved)>>;
+  state_t* state = arena_allocator<state_t>().allocate(1);
+  new (state) state_t{intercept_resolved, leaves_resolved};
+
+  const double intercept_val = state->intercept_.val_;
+  for (Eigen::Index k = 0; k < n_obs; ++k) {
+    double t = intercept_val;
+    std::apply(
+        [&t, k](const auto&... ls) { ((t = t + ls.fwd(k)), ...); },
+        state->leaves_);
+    y_hat.coeffRef(k) = var(
+        new internal::additive_tp_vari<std::decay_t<decltype(intercept_resolved)>,
+                                       std::decay_t<decltype(leaves_resolved)>>(
+            t, state, k));
+  }
+  return y_hat;
 }
 
 }  // namespace math
