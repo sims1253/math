@@ -437,8 +437,21 @@ struct resolved_slope2 {
   // operand's zero-initialized adjoint (= one rounded product e*xd2), then
   // m1 applies a fused vfmadd of that product by xd1 into the coefficient
   // adjoint. The volatile barrier forces the intermediate rounding.
+  // SPECIAL CASE xd1 == 1.0: stock's operator*(var, Arith) ALIASES its var
+  // operand when the multiplier is exactly 1.0 (no vari is created), so the
+  // composed path's m1 does not exist there and the increment is m2's
+  // single fused product fma(e, xd2, adj) — one rounding of the product,
+  // not two (the 1.0-multiplier class caught by the W-127 gate). The
+  // volatile copy of `e` in the generic path stops GCC from CSE-ing the two
+  // branches' e*xd2 products, which would leave the aliased branch's add
+  // unfused (two roundings — the exact bug the gate caught in disassembly).
   inline void rev(Eigen::Index k, double e) const {
-    volatile const double t = e * xd2_[k];
+    if (xd1_[k] == 1.0) {
+      coef_vi_->adj_ += xd2_[k] * e;
+      return;
+    }
+    volatile const double ev = e;
+    volatile const double t = ev * xd2_[k];
     coef_vi_->adj_ += xd1_[k] * t;
   }
 };
@@ -601,7 +614,6 @@ inline var bernoulli_logit_lpmf_gathered_additive(
   if (unlikely(n_obs == 0 || size_zero(n))) {
     return var(0.0);
   }
-  check_bounded(function, "n", n, 0, 1);
 
   vari* intercept_vi = intercept.vi_;
   const double intercept_val = intercept.vi_->val_;
@@ -611,7 +623,10 @@ inline var bernoulli_logit_lpmf_gathered_additive(
       = std::tuple(internal::resolve_leaf(leaves, n_obs)...);
 
   // Per-observation predictor in the composed path's exact op order:
-  // left-associated sum over already-rounded leaf values.
+  // left-associated sum over already-rounded leaf values. The gathered
+  // leaves' range checks fire HERE, in the composed path's per-element leaf
+  // order — i.e. BEFORE check_bounded, matching the transformed-parameter
+  // loop that runs ahead of the likelihood statement in the stock model.
   arena_t<T_partials_array> eta(n_obs);
   for (Eigen::Index k = 0; k < n_obs; ++k) {
     double t = intercept_val;
@@ -620,6 +635,7 @@ inline var bernoulli_logit_lpmf_gathered_additive(
         leaves_resolved);
     eta.coeffRef(k) = t;
   }
+  check_bounded(function, "n", n, 0, 1);
   check_not_nan(function, "Logit transformed probability parameter", eta);
   if constexpr (!include_summand<propto, T_intercept>::value) {
     return var(0.0);
