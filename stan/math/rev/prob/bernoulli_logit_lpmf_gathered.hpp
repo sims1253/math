@@ -295,6 +295,9 @@ struct gather_term {
   const char* name;
   const T_vec& coefs;
   const std::vector<int>& idx;
+  gather_term(const char* name, const T_vec& coefs,
+              const std::vector<int>& idx)
+      : name(name), coefs(coefs), idx(idx) {}
 };
 template <typename T_vec>
 gather_term(const char*, const T_vec&, const std::vector<int>&)
@@ -310,6 +313,7 @@ template <typename T_coef, typename T_d>
 struct slope_term {
   const T_coef& coef;
   const T_d& xd;
+  slope_term(const T_coef& coef, const T_d& xd) : coef(coef), xd(xd) {}
 };
 template <typename T_coef, typename T_d>
 slope_term(const T_coef&, const T_d&) -> slope_term<T_coef, T_d>;
@@ -324,6 +328,8 @@ struct slope2_term {
   const T_coef& coef;
   const T_d1& xd1;
   const T_d2& xd2;
+  slope2_term(const T_coef& coef, const T_d1& xd1, const T_d2& xd2)
+      : coef(coef), xd1(xd1), xd2(xd2) {}
 };
 template <typename T_coef, typename T_d1, typename T_d2>
 slope2_term(const T_coef&, const T_d1&, const T_d2&)
@@ -521,6 +527,112 @@ inline void rev_leaves(const Tuple& leaves, Eigen::Index k, double e) {
   }
 }
 
+// Shared impl for the additive overloads. `scatter=true`: the callback
+// scatters the increments into the coefficient adjoints directly (the shape
+// for likelihood-last models). `scatter=false`: the callback writes the
+// per-observation increments into `target`'s varis with the stock edge's
+// arithmetic, and the model's own transformed-parameter chains propagate
+// them (the shape for prior-statements-before-likelihood models such as
+// election88 — see the _tp overload's docs).
+template <bool propto, bool scatter, typename T_n, typename T_target,
+          typename T_intercept, typename... Leaves>
+inline var additive_impl(const T_n& n, const T_target* target,
+                         const T_intercept& intercept,
+                         const Leaves&... leaves) {
+  using T_partials_array = Eigen::Array<double, Eigen::Dynamic, 1>;
+  using std::exp;
+  static constexpr const char* function = "bernoulli_logit_lpmf";
+
+  const Eigen::Index n_obs = stan::math::size(n);
+  ((internal::check_leaf_size(function, n_obs, leaves)), ...);
+  if constexpr (!scatter) {
+    check_size_match(function, "Random variable size", n_obs,
+                     "Adjoint target size", target->size());
+  }
+  if (unlikely(n_obs == 0 || size_zero(n))) {
+    return var(0.0);
+  }
+
+  vari* intercept_vi = intercept.vi_;
+  const double intercept_val = intercept.vi_->val_;
+
+  // Resolve every leaf's routes (adjoint targets + forward values).
+  const auto leaves_resolved
+      = std::tuple(internal::resolve_leaf(leaves, n_obs)...);
+
+  // Per-observation predictor in the composed path's exact op order:
+  // left-associated sum over already-rounded leaf values. The gathered
+  // leaves' range checks fire HERE, in the composed path's per-element leaf
+  // order — i.e. BEFORE check_bounded, matching the transformed-parameter
+  // loop that runs ahead of the likelihood statement in the stock model.
+  arena_t<T_partials_array> eta(n_obs);
+  for (Eigen::Index k = 0; k < n_obs; ++k) {
+    double t = intercept_val;
+    std::apply(
+        [&t, k](const auto&... ls) { ((t = t + ls.fwd(k)), ...); },
+        leaves_resolved);
+    eta.coeffRef(k) = t;
+  }
+  check_bounded(function, "n", n, 0, 1);
+  check_not_nan(function, "Logit transformed probability parameter", eta);
+  if constexpr (!include_summand<propto, T_intercept>::value) {
+    return var(0.0);
+  }
+
+  // ---- bernoulli_logit_lpmf interior, verbatim (as in the 2PL overload) ----
+  const auto& n_col = as_column_vector_or_scalar(n);
+  const auto& n_double = value_of_rec(n_col);
+  auto signs = to_ref(2 * as_array_or_scalar(n_double) - 1);
+  T_partials_array ntheta = signs * eta;
+
+  T_partials_array exp_m_ntheta = exp(-ntheta);
+  static constexpr double cutoff = 20.0;
+  double logp = sum(
+      (ntheta > cutoff)
+          .select(-exp_m_ntheta,
+                  (ntheta < -cutoff).select(ntheta, -log1p(exp_m_ntheta))));
+
+  arena_t<T_partials_array> dtheta =
+      (ntheta > cutoff)
+          .select(-exp_m_ntheta,
+                  (ntheta >= -cutoff)
+                      .select(promote_scalar<double>(
+                                  signs * exp_m_ntheta / (exp_m_ntheta + 1)),
+                              promote_scalar<double>(signs)));
+  // ---- end of interior ------------------------------------------------------
+
+  if constexpr (scatter) {
+    return make_callback_var(
+        logp,
+        [intercept_vi, leaves_resolved, dtheta](const auto& vi) {
+          const double w = vi.adj_;
+          // Elements DESCENDING, leaves in reverse declaration order: the
+          // composed path's scalar varis are swept from the stack top down.
+          for (Eigen::Index k = dtheta.size() - 1; k >= 0; --k) {
+            const double e = w * dtheta.coeff(k);
+            internal::rev_leaves(leaves_resolved, k, e);
+            intercept_vi->adj_ += e;
+          }
+        });
+  } else {
+    // Stock's edge application, bit-for-bit: one FUSED multiply-add per
+    // element into the target vari's adjoint, elements ascending (the
+    // composed update_adjoints loop decoded at the model flags). Written as
+    // a single expression so GCC contracts it exactly as stock does.
+    arena_t<Eigen::Matrix<vari*, Eigen::Dynamic, 1>> target_vi(n_obs);
+    for (Eigen::Index k = 0; k < n_obs; ++k) {
+      target_vi.coeffRef(k) = target->coeff(k).vi_;
+    }
+    return make_callback_var(
+        logp, [target_vi, dtheta](const auto& vi) {
+          const double w = vi.adj_;
+          for (Eigen::Index k = 0; k < dtheta.size(); ++k) {
+            target_vi.coeff(k)->adj_ += w * dtheta.coeff(k);
+          }
+        });
+  }
+}
+
 }  // namespace internal
 
 /** \ingroup prob_dists
@@ -605,76 +717,9 @@ template <bool propto, typename T_n, typename T_intercept, typename... Leaves,
           require_vector_like_vt<std::is_integral, T_n>* = nullptr>
 inline var bernoulli_logit_lpmf_gathered_additive(
     const T_n& n, const T_intercept& intercept, const Leaves&... leaves) {
-  using T_partials_array = Eigen::Array<double, Eigen::Dynamic, 1>;
-  using std::exp;
-  static constexpr const char* function = "bernoulli_logit_lpmf";
-
-  const Eigen::Index n_obs = stan::math::size(n);
-  ((internal::check_leaf_size(function, n_obs, leaves)), ...);
-  if (unlikely(n_obs == 0 || size_zero(n))) {
-    return var(0.0);
-  }
-
-  vari* intercept_vi = intercept.vi_;
-  const double intercept_val = intercept.vi_->val_;
-
-  // Resolve every leaf's routes (adjoint targets + forward values).
-  const auto leaves_resolved
-      = std::tuple(internal::resolve_leaf(leaves, n_obs)...);
-
-  // Per-observation predictor in the composed path's exact op order:
-  // left-associated sum over already-rounded leaf values. The gathered
-  // leaves' range checks fire HERE, in the composed path's per-element leaf
-  // order — i.e. BEFORE check_bounded, matching the transformed-parameter
-  // loop that runs ahead of the likelihood statement in the stock model.
-  arena_t<T_partials_array> eta(n_obs);
-  for (Eigen::Index k = 0; k < n_obs; ++k) {
-    double t = intercept_val;
-    std::apply(
-        [&t, k](const auto&... ls) { ((t = t + ls.fwd(k)), ...); },
-        leaves_resolved);
-    eta.coeffRef(k) = t;
-  }
-  check_bounded(function, "n", n, 0, 1);
-  check_not_nan(function, "Logit transformed probability parameter", eta);
-  if constexpr (!include_summand<propto, T_intercept>::value) {
-    return var(0.0);
-  }
-
-  // ---- bernoulli_logit_lpmf interior, verbatim (as in the 2PL overload) ----
-  const auto& n_col = as_column_vector_or_scalar(n);
-  const auto& n_double = value_of_rec(n_col);
-  auto signs = to_ref(2 * as_array_or_scalar(n_double) - 1);
-  T_partials_array ntheta = signs * eta;
-
-  T_partials_array exp_m_ntheta = exp(-ntheta);
-  static constexpr double cutoff = 20.0;
-  double logp = sum(
-      (ntheta > cutoff)
-          .select(-exp_m_ntheta,
-                  (ntheta < -cutoff).select(ntheta, -log1p(exp_m_ntheta))));
-
-  arena_t<T_partials_array> dtheta =
-      (ntheta > cutoff)
-          .select(-exp_m_ntheta,
-                  (ntheta >= -cutoff)
-                      .select(promote_scalar<double>(
-                                  signs * exp_m_ntheta / (exp_m_ntheta + 1)),
-                              promote_scalar<double>(signs)));
-  // ---- end of interior ------------------------------------------------------
-
-  return make_callback_var(
-      logp,
-      [intercept_vi, leaves_resolved, dtheta](const auto& vi) {
-        const double w = vi.adj_;
-        // Elements DESCENDING, leaves in reverse declaration order: the
-        // composed path's scalar varis are swept from the stack top down.
-        for (Eigen::Index k = dtheta.size() - 1; k >= 0; --k) {
-          const double e = w * dtheta.coeff(k);
-          internal::rev_leaves(leaves_resolved, k, e);
-          intercept_vi->adj_ += e;
-        }
-      });
+  return internal::additive_impl<propto, true>(
+      n, static_cast<const Eigen::Matrix<var, Eigen::Dynamic, 1>*>(nullptr),
+      intercept, leaves...);
 }
 
 /** \ingroup prob_dists
@@ -687,7 +732,72 @@ template <typename T_n, typename T_intercept, typename... Leaves,
           require_vector_like_vt<std::is_integral, T_n>* = nullptr>
 inline var bernoulli_logit_lpmf_gathered_additive(
     const T_n& n, const T_intercept& intercept, const Leaves&... leaves) {
-  return bernoulli_logit_lpmf_gathered_additive<true>(n, intercept, leaves...);
+  return internal::additive_impl<true, true>(
+      n, static_cast<const Eigen::Matrix<var, Eigen::Dynamic, 1>*>(nullptr),
+      intercept, leaves...);
+}
+
+/** \ingroup prob_dists
+ * Transformed-parameter-writeback variant of the additive multi-gather
+ * Bernoulli-logit likelihood, for models whose predictor is ALSO consumed
+ * through a transformed parameter (`vector[N] y_hat` built by a per-element
+ * loop and kept materialized for output, the election88 class).
+ *
+ * The value path is identical to `bernoulli_logit_lpmf_gathered_additive`
+ * (the predictor is recomputed from the gathered operands in stock's exact
+ * op order — the transformed-parameter loop is retained untouched for the
+ * output columns, and its recomputation is bit-identical by construction).
+ * The REVERSE pass, however, does NOT scatter into the coefficient adjoints
+ * directly: it applies its per-observation increments to
+ * `adjoint_target[k]`'s own vari with stock edge arithmetic (one fused
+ * multiply-add per element, elements ascending — the composed
+ * `bernoulli_logit_lpmf`'s edge application bit-for-bit), and the retained
+ * transformed-parameter expression's own varis then propagate them at their
+ * machine-code-verified stack position and schedule.
+ *
+ * WHY: when the model block's PRIOR statements touch the coefficient
+ * vectors BEFORE the likelihood statement (election88: `a ~ normal(0,
+ * sigma_a); ...; y ~ bernoulli_logit(y_hat);`), the reverse-mode stack
+ * sweep applies the prior edges BETWEEN the likelihood edge and the
+ * transformed-parameter chains. Direct scattering from the likelihood's
+ * stack position would accumulate each coefficient's adjoint in the
+ * opposite order (`sum + prior` vs stock's `prior + sum`) — a 1-ulp
+ * reorder (values stay bit-identical; W-127 measured 0/100 lp mismatches
+ * with 100/100 gradient rows differing by 1 ulp). The writeback variant
+ * reproduces stock exactly in that layout; the direct-scatter overload is
+ * the right shape when the likelihood is the last statement touching its
+ * operands (the gathered-operand class of the 2PL/radon models, where the
+ * composed path's own callbacks also sit at the likelihood's stack
+ * position).
+ *
+ * @param adjoint_target the transformed-parameter vector whose per-element
+ * varis receive the likelihood's adjoint increments (stock's `y_hat`; its
+ * values are NOT read — the predictor is recomputed from the leaves)
+ */
+template <bool propto, typename T_n, typename T_target, typename T_intercept,
+          typename... Leaves, require_st_var<T_intercept>* = nullptr,
+          require_vector_like_vt<std::is_integral, T_n>* = nullptr,
+          require_rev_matrix_t<T_target>* = nullptr>
+inline var bernoulli_logit_lpmf_gathered_additive_tp(
+    const T_n& n, const T_target& adjoint_target,
+    const T_intercept& intercept, const Leaves&... leaves) {
+  return internal::additive_impl<propto, false>(n, &adjoint_target, intercept,
+                                                leaves...);
+}
+
+/** \ingroup prob_dists
+ * Transformed-parameter-writeback variant (see the propto overload). Drops
+ * constant terms; there are none for this distribution.
+ */
+template <typename T_n, typename T_target, typename T_intercept,
+          typename... Leaves, require_st_var<T_intercept>* = nullptr,
+          require_vector_like_vt<std::is_integral, T_n>* = nullptr,
+          require_rev_matrix_t<T_target>* = nullptr>
+inline var bernoulli_logit_lpmf_gathered_additive_tp(
+    const T_n& n, const T_target& adjoint_target,
+    const T_intercept& intercept, const Leaves&... leaves) {
+  return internal::additive_impl<true, false>(n, &adjoint_target, intercept,
+                                              leaves...);
 }
 
 }  // namespace math
