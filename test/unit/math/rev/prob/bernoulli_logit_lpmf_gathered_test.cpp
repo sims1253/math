@@ -600,3 +600,336 @@ TEST(RevProbBernoulliLogitGathered, AdditiveThrowSet) {
     stan::math::recover_memory();
   }
 }
+
+// ---------------------------------------------------------------------------
+// W-130: the TP-block custom vari (gathered_additive_tp) — one custom vari
+// per element created at the transformed-parameters loop, the likelihood
+// line stock. Bitwise vs the FULLY-STOCK composed path (tp loop + stock
+// bernoulli_logit_lpmf), with the slope coefficient vector beta layout-varied
+// too (in the built election88 .so every parameter vector is SoA — the
+// deserializer's to_var_value — whose stock discipline is the per-element
+// rvalue view + callback one; .coeff on the layout-active operand IS that
+// path), plus the causal-triangle prior-position controls and the throw set.
+// ---------------------------------------------------------------------------
+namespace {
+
+template <typename BetaT, typename G0, typename G1, typename G2>
+var tp_vari_stock_chain(const BetaT& beta, const std::vector<double>& xd2,
+                        const std::vector<double>& xd3,
+                        const std::vector<double>& xd31,
+                        const std::vector<double>& xd32, const G0& g0,
+                        const std::vector<int>& i0, const G1& g1,
+                        const std::vector<int>& i1, const G2& g2,
+                        const std::vector<int>& i2, Eigen::Index k) {
+  return ((((((beta.coeff(0) + (beta.coeff(1) * xd2[k])) +
+              (beta.coeff(2) * xd3[k])) +
+             ((beta.coeff(4) * xd31[k]) * xd32[k])) +
+            g0.coeff(i0[k] - 1)) +
+           g1.coeff(i1[k] - 1)) +
+          g2.coeff(i2[k] - 1));
+}
+
+// beta in one of the three deserializer layouts (AoS / SoA / Map-over-AoS)
+template <int layout>
+struct TpBeta {
+  Matrix<var, Dynamic, 1> aos;
+  stan::math::var_value<Eigen::Matrix<double, Dynamic, 1>> soa{
+      Eigen::Matrix<double, Dynamic, 1>(0)};
+
+  explicit TpBeta(const Eigen::Matrix<double, Dynamic, 1>& v) : aos(v) {
+    if constexpr (layout == 1)
+      soa = stan::math::var_value<Eigen::Matrix<double, Dynamic, 1>>(v);
+  }
+  auto b() const {
+    if constexpr (layout == 1)
+      return (const stan::math::var_value<Eigen::Matrix<double, Dynamic, 1>>&)
+          soa;
+    else if constexpr (layout == 2)
+      return Eigen::Map<const Matrix<var, Dynamic, 1>>(aos.data(),
+                                                       aos.size());
+    else
+      return (const Matrix<var, Dynamic, 1>&)aos;
+  }
+  Eigen::Matrix<double, Dynamic, 1> adj() const {
+    Eigen::Matrix<double, Dynamic, 1> g(aos.size());
+    if constexpr (layout == 1) {
+      for (Eigen::Index j = 0; j < g.size(); ++j)
+        g(j) = soa.vi_->adj_.coeff(j);
+    } else {
+      for (Eigen::Index j = 0; j < g.size(); ++j) g(j) = aos.coeff(j).adj();
+    }
+    return g;
+  }
+};
+
+struct TpVariResult {
+  double lp;
+  Eigen::Matrix<double, Dynamic, 1> b_adj, g0_adj, g1_adj, g2_adj;
+  Eigen::Matrix<double, Dynamic, 1> yhat;
+};
+
+// prior_pos: 0 none, 1 BEFORE the likelihood, 2 AFTER it.
+template <int beta_layout, int g_layout, int prior_pos>
+TpVariResult tp_vari_composed(const AdditiveCase& c) {
+  TpVariResult r;
+  using intc = std::integral_constant<int, g_layout>;
+  using IN = AdditiveInputs<intc>;
+  IN in(c.g0, c.g1, c.g2);
+  TpBeta<beta_layout> beta(c.beta);
+  Matrix<var, Dynamic, 1> y_hat(c.y.size());
+  for (Eigen::Index k = 0; k < y_hat.size(); ++k) {
+    y_hat.coeffRef(k) = tp_vari_stock_chain(
+        beta.b(), c.xd2, c.xd3, c.xd31, c.xd32, in.g0(), c.i0, in.g1(), c.i1,
+        in.g2(), c.i2, k);
+  }
+  r.yhat.resize(y_hat.size());
+  for (Eigen::Index k = 0; k < y_hat.size(); ++k) r.yhat(k) = y_hat(k).val();
+  var lp = stan::math::bernoulli_logit_lpmf<false>(c.y, y_hat);
+  var s1(1.3), s2(0.8), s3(2.2), s4(9.1);
+  // NOTE: this math's normal_lpdf does not accept var_value vectors, so the
+  // prior-position tests restrict the operands to the AoS/Map layouts (the
+  // SoA+prior combinations are certified by the gate-a harness, which runs
+  // on the bundle's newer math).
+  if constexpr (prior_pos == 1) {
+    lp = lp + stan::math::normal_lpdf<false>(in.g0(), 0.0, s1);
+    lp = lp + stan::math::normal_lpdf<false>(in.g1(), 0.0, s2);
+    lp = lp + stan::math::normal_lpdf<false>(in.g2(), 0.0, s3);
+    lp = lp + stan::math::normal_lpdf<false>(beta.b(), 0.0, s4);
+  }
+  r.lp = lp.val();
+  if constexpr (prior_pos == 2) {
+    lp = lp + stan::math::normal_lpdf<false>(in.g0(), 0.0, s1);
+    lp = lp + stan::math::normal_lpdf<false>(in.g1(), 0.0, s2);
+    lp = lp + stan::math::normal_lpdf<false>(in.g2(), 0.0, s3);
+    lp = lp + stan::math::normal_lpdf<false>(beta.b(), 0.0, s4);
+  }
+  lp.grad();
+  r.b_adj = beta.adj();
+  r.g0_adj = in.adj(0);
+  r.g1_adj = in.adj(1);
+  r.g2_adj = in.adj(2);
+  stan::math::recover_memory();
+  return r;
+}
+
+template <int beta_layout, int g_layout, int prior_pos>
+TpVariResult tp_vari_factory(const AdditiveCase& c) {
+  TpVariResult r;
+  using intc = std::integral_constant<int, g_layout>;
+  using IN = AdditiveInputs<intc>;
+  IN in(c.g0, c.g1, c.g2);
+  TpBeta<beta_layout> beta(c.beta);
+  Matrix<var, Dynamic, 1> y_hat = stan::math::gathered_additive_tp(
+      static_cast<Eigen::Index>(c.y.size()),
+      stan::math::slot_term{"beta", beta.b(), 1},
+      stan::math::slot_slope_term{"beta", beta.b(), 2, c.xd2},
+      stan::math::slot_slope_term{"beta", beta.b(), 3, c.xd3},
+      stan::math::slot_slope2_term{"beta", beta.b(), 5, c.xd31, c.xd32},
+      stan::math::gather_term{"g0", in.g0(), c.i0},
+      stan::math::gather_term{"g1", in.g1(), c.i1},
+      stan::math::gather_term{"g2", in.g2(), c.i2});
+  r.yhat.resize(y_hat.size());
+  for (Eigen::Index k = 0; k < y_hat.size(); ++k) r.yhat(k) = y_hat(k).val();
+  var lp = stan::math::bernoulli_logit_lpmf<false>(c.y, y_hat);
+  var s1(1.3), s2(0.8), s3(2.2), s4(9.1);
+  // NOTE: this math's normal_lpdf does not accept var_value vectors, so the
+  // prior-position tests restrict the operands to the AoS/Map layouts (the
+  // SoA+prior combinations are certified by the gate-a harness, which runs
+  // on the bundle's newer math).
+  if constexpr (prior_pos == 1) {
+    lp = lp + stan::math::normal_lpdf<false>(in.g0(), 0.0, s1);
+    lp = lp + stan::math::normal_lpdf<false>(in.g1(), 0.0, s2);
+    lp = lp + stan::math::normal_lpdf<false>(in.g2(), 0.0, s3);
+    lp = lp + stan::math::normal_lpdf<false>(beta.b(), 0.0, s4);
+  }
+  r.lp = lp.val();
+  if constexpr (prior_pos == 2) {
+    lp = lp + stan::math::normal_lpdf<false>(in.g0(), 0.0, s1);
+    lp = lp + stan::math::normal_lpdf<false>(in.g1(), 0.0, s2);
+    lp = lp + stan::math::normal_lpdf<false>(in.g2(), 0.0, s3);
+    lp = lp + stan::math::normal_lpdf<false>(beta.b(), 0.0, s4);
+  }
+  lp.grad();
+  r.b_adj = beta.adj();
+  r.g0_adj = in.adj(0);
+  r.g1_adj = in.adj(1);
+  r.g2_adj = in.adj(2);
+  stan::math::recover_memory();
+  return r;
+}
+
+void expect_tp_vari_equal(const TpVariResult& s, const TpVariResult& p) {
+  EXPECT_TRUE(bits_equal(s.lp, p.lp)) << "lp " << s.lp << " vs " << p.lp;
+  for (Eigen::Index k = 0; k < s.yhat.size(); ++k)
+    EXPECT_TRUE(bits_equal(s.yhat(k), p.yhat(k))) << "y_hat " << k << " "
+                                                  << s.yhat(k) << " vs "
+                                                  << p.yhat(k);
+  for (int j = 0; j < s.b_adj.size(); ++j)
+    EXPECT_TRUE(bits_equal(s.b_adj(j), p.b_adj(j))) << "beta adj " << j;
+  for (int j = 0; j < s.g0_adj.size(); ++j)
+    EXPECT_TRUE(bits_equal(s.g0_adj(j), p.g0_adj(j))) << "g0 adj " << j;
+  for (int j = 0; j < s.g1_adj.size(); ++j)
+    EXPECT_TRUE(bits_equal(s.g1_adj(j), p.g1_adj(j))) << "g1 adj " << j;
+  for (int j = 0; j < s.g2_adj.size(); ++j)
+    EXPECT_TRUE(bits_equal(s.g2_adj(j), p.g2_adj(j))) << "g2 adj " << j;
+}
+
+}  // namespace
+
+TEST(RevProbBernoulliLogitGathered, TpVariBitIdenticalToComposedStock) {
+  std::mt19937 rng(20260831);
+  for (int rep = 0; rep < 4; ++rep) {
+    const int N = 1 + static_cast<int>(rng() % 900);
+    const double scale = (rep % 3 == 2) ? 14.0 : 1.0;
+    AdditiveCase c = make_additive_case(rng, N, scale);
+    // every beta x gather layout combination (9), no priors
+    expect_tp_vari_equal(tp_vari_composed<0, 0, 0>(c),
+                         tp_vari_factory<0, 0, 0>(c));
+    expect_tp_vari_equal(tp_vari_composed<0, 1, 0>(c),
+                         tp_vari_factory<0, 1, 0>(c));
+    expect_tp_vari_equal(tp_vari_composed<0, 2, 0>(c),
+                         tp_vari_factory<0, 2, 0>(c));
+    expect_tp_vari_equal(tp_vari_composed<1, 0, 0>(c),
+                         tp_vari_factory<1, 0, 0>(c));
+    expect_tp_vari_equal(tp_vari_composed<1, 1, 0>(c),
+                         tp_vari_factory<1, 1, 0>(c));
+    expect_tp_vari_equal(tp_vari_composed<1, 2, 0>(c),
+                         tp_vari_factory<1, 2, 0>(c));
+    expect_tp_vari_equal(tp_vari_composed<2, 0, 0>(c),
+                         tp_vari_factory<2, 0, 0>(c));
+    expect_tp_vari_equal(tp_vari_composed<2, 1, 0>(c),
+                         tp_vari_factory<2, 1, 0>(c));
+    expect_tp_vari_equal(tp_vari_composed<2, 2, 0>(c),
+                         tp_vari_factory<2, 2, 0>(c));
+  }
+}
+
+TEST(RevProbBernoulliLogitGathered, TpVariPriorsBothSides) {
+  // the causal triangle: the custom varis are created at the tp loop, so
+  // delivery is at stock's position regardless of where the likelihood sits
+  // among the model statements — priors BEFORE (the election88 layout, the
+  // W-129 failure case) and AFTER must BOTH be bitwise exact.
+  std::mt19937 rng(20260901);
+  for (int rep = 0; rep < 3; ++rep) {
+    const int N = 1 + static_cast<int>(rng() % 600);
+    AdditiveCase c = make_additive_case(rng, N, 1.0);
+    expect_tp_vari_equal(tp_vari_composed<0, 0, 1>(c),
+                         tp_vari_factory<0, 0, 1>(c));
+    expect_tp_vari_equal(tp_vari_composed<2, 2, 1>(c),
+                         tp_vari_factory<2, 2, 1>(c));
+    expect_tp_vari_equal(tp_vari_composed<0, 2, 1>(c),
+                         tp_vari_factory<0, 2, 1>(c));
+    expect_tp_vari_equal(tp_vari_composed<2, 0, 1>(c),
+                         tp_vari_factory<2, 0, 1>(c));
+    expect_tp_vari_equal(tp_vari_composed<0, 0, 2>(c),
+                         tp_vari_factory<0, 0, 2>(c));
+    expect_tp_vari_equal(tp_vari_composed<2, 2, 2>(c),
+                         tp_vari_factory<2, 2, 2>(c));
+    expect_tp_vari_equal(tp_vari_composed<0, 2, 2>(c),
+                         tp_vari_factory<0, 2, 2>(c));
+    expect_tp_vari_equal(tp_vari_composed<2, 0, 2>(c),
+                         tp_vari_factory<2, 0, 2>(c));
+  }
+}
+
+TEST(RevProbBernoulliLogitGathered, TpVariValueMatchesReference) {
+  // hand-computed 3-point case: eta = b1 + b2*xd2 + b3*xd3 + (b5*xd31)*xd32
+  // + g0[i0] + g1[i1] + g2[i2]
+  std::vector<int> y{1, 0, 1};
+  std::vector<int> i0{1, 2, 3}, i1{4, 5, 1}, i2{9, 3, 7};
+  std::vector<double> xd2{0.5, -1.25, 2.0};
+  std::vector<double> xd3{1.0, 0.0, 1.0};   // the 1.0 alias
+  std::vector<double> xd31{1.0, 1.0, 0.0};  // the m1 alias
+  std::vector<double> xd32{0.25, 3.5, -2.0};
+  Matrix<var, Dynamic, 1> beta(5);
+  beta << var(-0.3), var(0.7), var(-1.1), var(99.0), var(0.4);
+  Matrix<var, Dynamic, 1> g0(3), g1(5), g2(9);
+  for (int j = 0; j < 3; ++j) g0.coeffRef(j) = var(0.1 * (j + 1));
+  for (int j = 0; j < 5; ++j) g1.coeffRef(j) = var(-0.2 * (j + 1));
+  for (int j = 0; j < 9; ++j) g2.coeffRef(j) = var(0.05 * (j + 1));
+  Matrix<var, Dynamic, 1> y_hat = stan::math::gathered_additive_tp(
+      3, stan::math::slot_term{"beta", beta, 1},
+      stan::math::slot_slope_term{"beta", beta, 2, xd2},
+      stan::math::slot_slope_term{"beta", beta, 3, xd3},
+      stan::math::slot_slope2_term{"beta", beta, 5, xd31, xd32},
+      stan::math::gather_term{"g0", g0, i0}, stan::math::gather_term{"g1", g1, i1},
+      stan::math::gather_term{"g2", g2, i2});
+  EXPECT_FLOAT_EQ(-0.3 + 0.7 * 0.5 + -1.1 * 1.0 + 0.4 * 1.0 * 0.25 + 0.1
+                      + -0.8 + 0.45,
+                  y_hat(0).val());
+  EXPECT_FLOAT_EQ(-0.3 + 0.7 * -1.25 + -1.1 * 0.0 + 0.4 * 1.0 * 3.5 + 0.2
+                      + -1.0 + 0.15,
+                  y_hat(1).val());
+  EXPECT_FLOAT_EQ(-0.3 + 0.7 * 2.0 + -1.1 * 1.0 + 0.4 * 0.0 * -2.0 + 0.3
+                      + -0.2 + 0.35,
+                  y_hat(2).val());
+  var lp = stan::math::bernoulli_logit_lpmf<false>(y, y_hat);
+  // the stock DOUBLE lpmf over the hand-computed eta values
+  Eigen::Matrix<double, Dynamic, 1> eta(3);
+  eta << -0.3 + 0.7 * 0.5 + -1.1 * 1.0 + 0.4 * 1.0 * 0.25 + 0.1 + -0.8 + 0.45,
+      -0.3 + 0.7 * -1.25 + -1.1 * 0.0 + 0.4 * 1.0 * 3.5 + 0.2 + -1.0 + 0.15,
+      -0.3 + 0.7 * 2.0 + -1.1 * 1.0 + 0.4 * 0.0 * -2.0 + 0.3 + -0.2 + 0.35;
+  EXPECT_FLOAT_EQ(stan::math::bernoulli_logit_lpmf<false>(y, eta), lp.val());
+  lp.grad();
+  stan::math::recover_memory();
+}
+
+TEST(RevProbBernoulliLogitGathered, TpVariThrowSet) {
+  std::vector<int> y{1, 1, 1};
+  std::vector<int> i0{1, 2, 1}, i1{1, 1, 1}, i2{1, 1, 1};
+  std::vector<double> xd2(3, 0.5), xd3(3, 1.0), xd31(3, 1.0), xd32(3, 0.5);
+  Matrix<var, Dynamic, 1> beta(5);
+  for (int j = 0; j < 5; ++j) beta.coeffRef(j) = var(0.2 * j);
+  Matrix<var, Dynamic, 1> g0(2), g1(1), g2(1);
+  g0 << var(0.3), var(-0.3);
+  g1 << var(0.4);
+  g2 << var(0.5);
+  // out-of-range gathered index -> stock's rvalue text at the tp position
+  {
+    std::vector<int> ibad{1, 3, 1};
+    try {
+      auto yh = stan::math::gathered_additive_tp(
+          3, stan::math::slot_term{"beta", beta, 1},
+          stan::math::slot_slope_term{"beta", beta, 2, xd2},
+          stan::math::gather_term{"g0", g0, ibad});
+      (void)yh;
+      ADD_FAILURE() << "expected out_of_range";
+    } catch (const std::out_of_range& e) {
+      EXPECT_NE(std::string(e.what()).find("vector[uni] indexing"),
+                std::string::npos);
+    }
+    stan::math::recover_memory();
+  }
+  // NaN coefficient -> the STOCK likelihood's indexed check_not_nan text
+  {
+    Matrix<var, Dynamic, 1> gn(2);
+    gn << var(0.3), var(std::numeric_limits<double>::quiet_NaN());
+    Matrix<var, Dynamic, 1> yh = stan::math::gathered_additive_tp(
+        3, stan::math::slot_term{"beta", beta, 1},
+        stan::math::gather_term{"g0", gn, i0});
+    try {
+      var lp = stan::math::bernoulli_logit_lpmf<true>(y, yh);
+      (void)lp;
+      ADD_FAILURE() << "expected domain_error";
+    } catch (const std::domain_error& e) {
+      EXPECT_EQ(std::string(e.what()),
+                "bernoulli_logit_lpmf: Logit transformed probability"
+                " parameter[2] is nan, but must be not nan!");
+    }
+    stan::math::recover_memory();
+  }
+  // out-of-range slot (defensive API guard, stock's rvalue text)
+  {
+    try {
+      auto yh = stan::math::gathered_additive_tp(
+          3, stan::math::slot_term{"beta", beta, 9},
+          stan::math::gather_term{"g0", g0, i0});
+      (void)yh;
+      ADD_FAILURE() << "expected out_of_range";
+    } catch (const std::out_of_range& e) {
+      EXPECT_NE(std::string(e.what()).find("vector[uni] indexing"),
+                std::string::npos);
+    }
+    stan::math::recover_memory();
+  }
+}
