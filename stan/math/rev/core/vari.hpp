@@ -65,6 +65,13 @@ class vari_base {
 };
 
 /**
+ * W-118 (W-53-class batching): tag type selecting the unregistered
+ * (batch) constructor of the scalar `vari_value<T>` below.
+ */
+struct vari_no_stack_t {};
+inline constexpr vari_no_stack_t vari_no_stack{};
+
+/**
  * The variable implementation for floating point types.
  *
  * This class is complete (not abstract) and may be used for
@@ -130,6 +137,18 @@ class vari_value<T, require_t<std::is_floating_point<T>>> : public vari_base {
       ChainableStack::instance_->var_nochain_stack_.push_back(this);
     }
   }
+
+  /**
+   * W-118 (W-53-class batching): construct a vari record with value `x`
+   * and adjoint 0.0 WITHOUT registering it on any stack. The caller
+   * placement-constructs whole batches of records in one arena
+   * allocation with this constructor and is responsible for the
+   * records' zeroing parity (one batch-span registration on the
+   * nochain stack). The record's layout (vptr, val_, adj_), value, and
+   * zero adjoint are identical to `vari_value(x, false)`; only the
+   * per-record stack registration is elided.
+   */
+  vari_value(T x, vari_no_stack_t) noexcept : val_(x) {}
 
   /**
    * Return a constant reference to the value of this vari.
