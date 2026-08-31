@@ -10,6 +10,14 @@
 #include <stan/math/prim/fun/typedefs.hpp>
 #include <stan/math/prim/fun/eigendecompose_sym.hpp>
 
+#include <limits>
+
+// Relative eigenvalue gap below kappa * max(1, |w|_inf) * eps marks a
+// numerically degenerate cluster for the reverse-mode adjoint.
+#ifndef STAN_MATH_EIGEN_GAP_KAPPA
+#define STAN_MATH_EIGEN_GAP_KAPPA 1e3
+#endif
+
 namespace stan {
 namespace math {
 
@@ -45,15 +53,43 @@ inline auto eigendecompose_sym(const T& m) {
                      * eigenvecs.val().transpose();
     // eigenvector reverse calculation
     const auto p = arena_m.val().cols();
+    // Cluster-aware adjoint: see rev/fun/eigenvectors_sym.hpp. Pairs whose
+    // gap is below STAN_MATH_EIGEN_GAP_KAPPA * max(1, |w|_inf) * eps form
+    // a degenerate cluster; their 1/(w_j - w_i) coupling is replaced by
+    // zero (minimal-norm gauge). Well-separated spectra take the original
+    // path below, unchanged.
+    const double eigengap_tau
+        = STAN_MATH_EIGEN_GAP_KAPPA
+          * std::max(1.0, eigenvals.val().cwiseAbs().maxCoeff())
+          * std::numeric_limits<double>::epsilon();
+    const bool has_degenerate_gap
+        = p > 1
+          && (eigenvals.val().tail(p - 1) - eigenvals.val().head(p - 1))
+                     .minCoeff()
+                 < eigengap_tau;
+    Eigen::MatrixXd vector_adj;
+    if (unlikely(has_degenerate_gap)) {
+      Eigen::MatrixXd gaps
+          = eigenvals.val().rowwise().replicate(p).transpose()
+            - eigenvals.val().rowwise().replicate(p);
+      Eigen::MatrixXd f = (gaps.array().abs() >= eigengap_tau)
+                              .select(gaps.array().inverse(),
+                                      Eigen::MatrixXd::Zero(p, p));
+      vector_adj = eigenvecs.val()
+                   * f.cwiseProduct(
+                       eigenvecs.val().transpose() * eigenvecs.adj_op())
+                   * eigenvecs.val().transpose();
+    } else {
     Eigen::MatrixXd f = (1
                          / (eigenvals.val().rowwise().replicate(p).transpose()
                             - eigenvals.val().rowwise().replicate(p))
                                .array());
     f.diagonal().setZero();
-    auto vector_adj
-        = eigenvecs.val()
-          * f.cwiseProduct(eigenvecs.val().transpose() * eigenvecs.adj_op())
-          * eigenvecs.val().transpose();
+    vector_adj = eigenvecs.val()
+                 * f.cwiseProduct(
+                     eigenvecs.val().transpose() * eigenvecs.adj_op())
+                 * eigenvecs.val().transpose();
+    }
 
     arena_m.adj() += value_adj + vector_adj;
   });
