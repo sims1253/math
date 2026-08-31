@@ -158,6 +158,39 @@ class ops_partials_edge<double, Op, require_eigen_st<is_var, Op>> {
   inline auto size() const noexcept { return this->operands_.size(); }
 };
 
+/**
+ * Edge for an Eigen operand with `var` scalar type whose partials the
+ * distribution has already computed. This is identical to
+ * `ops_partials_edge<double, Op, require_eigen_st<is_var, Op>>` except that
+ * `partials_` is constructed from the partials carried in the
+ * `operand_with_partials` argument instead of being zero-initialized by the
+ * constructor and fully assigned later, which removes one pass over the
+ * partials array (the zero-write). The reverse-mode behavior (`build()`,
+ * `update_adjoints`) is unchanged: same operand storage, same partials type,
+ * same callback position.
+ */
+template <typename Op, typename Partials>
+class ops_partials_edge<double, operand_with_partials<Op, Partials>> {
+ public:
+  using wrapped_op_t = std::decay_t<Op>;
+  using base_edge_t =
+      ops_partials_edge<double, wrapped_op_t,
+                        require_eigen_st<is_var, wrapped_op_t>>;
+  using partials_t = typename base_edge_t::partials_t;
+  partials_t partials_;                       // For univariate use-cases
+  broadcast_array<partials_t> partials_vec_;  // For multivariate
+  explicit ops_partials_edge(
+      const operand_with_partials<Op, Partials>& ops)
+      : partials_(ops.partials),
+        partials_vec_(partials_),
+        operands_(to_arena(ops.operand)) {}
+
+  inline auto& partial() noexcept { return partials_; }
+  inline auto& operand() noexcept { return operands_; }
+  arena_t<wrapped_op_t> operands_;
+  inline auto size() const noexcept { return this->operands_.size(); }
+};
+
 template <typename Op>
 class ops_partials_edge<double, var_value<Op>, require_eigen_t<Op>> {
  public:
