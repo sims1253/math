@@ -106,9 +106,27 @@ struct AutodiffStackSingleton {
     std::vector<ChainableAllocT *> var_alloc_stack_;
     stack_alloc memalloc_;
 
+    // W-53 research slice: spans of batch-constructed nochain varis.
+    // Registered ONLY by make_nochain_vari_array (one span per batch);
+    // walked by set_zero_all_adjoints{,_nested} with the stored stride
+    // (always sizeof(vari_value<double>) today); cleared / truncated by
+    // recover_memory{,_nested} in lockstep with the per-vari stacks.
+    // Semantically equivalent to pushing every record of the batch on
+    // var_nochain_stack_: zeroing walks exactly those records.
+    struct NoChainSpan {
+      ChainableT *begin;
+      size_t count;
+      size_t stride;  // record size in bytes
+    };
+    std::vector<NoChainSpan> var_nochain_spans_;
+    // running total of records covered by var_nochain_spans_ (keeps
+    // profiling accounting equal to per-vari registration)
+    size_t nochain_span_records_ = 0;
+
     // nested positions
     std::vector<size_t> nested_var_stack_sizes_;
     std::vector<size_t> nested_var_nochain_stack_sizes_;
+    std::vector<size_t> nested_var_nochain_span_sizes_;
     std::vector<size_t> nested_var_alloc_stack_starts_;
   };
 

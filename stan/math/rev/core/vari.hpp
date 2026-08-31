@@ -65,6 +65,13 @@ class vari_base {
 };
 
 /**
+ * W-53 research slice: tag type selecting the unregistered
+ * (batch-span) constructor of `vari_value<T>` below.
+ */
+struct vari_no_stack_t {};
+inline constexpr vari_no_stack_t vari_no_stack{};
+
+/**
  * The variable implementation for floating point types.
  *
  * This class is complete (not abstract) and may be used for
@@ -130,6 +137,18 @@ class vari_value<T, require_t<std::is_floating_point<T>>> : public vari_base {
       ChainableStack::instance_->var_nochain_stack_.push_back(this);
     }
   }
+
+  /**
+   * W-53 research slice: construct a vari record with value `x` and
+   * adjoint 0.0 WITHOUT registering it on any stack.
+   * `make_nochain_vari_array` constructs whole batches of records via
+   * placement-new with this constructor (one arena allocation for the
+   * array) and registers the batch as ONE nochain span. The record's
+   * layout (vptr, val_, adj_), value, and zero adjoint are identical
+   * to `vari_value(x, false)`; only the registration mechanism
+   * differs.
+   */
+  vari_value(T x, vari_no_stack_t) noexcept : val_(x) {}
 
   /**
    * Return a constant reference to the value of this vari.

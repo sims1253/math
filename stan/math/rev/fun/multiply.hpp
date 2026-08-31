@@ -4,6 +4,7 @@
 #include <stan/math/rev/meta.hpp>
 #include <stan/math/rev/core.hpp>
 #include <stan/math/rev/core/typedefs.hpp>
+#include <stan/math/rev/core/make_nochain_vari_array.hpp>
 #include <stan/math/rev/fun/value_of.hpp>
 #include <type_traits>
 
@@ -35,42 +36,102 @@ inline auto multiply(T1&& A, T2&& B) {
     auto arena_B_val = to_arena(arena_B.val());
     using return_t
         = return_var_matrix_t<decltype(arena_A_val * arena_B_val), T1, T2>;
-    arena_t<return_t> res = arena_A_val * arena_B_val;
+    if constexpr (is_eigen_v<return_t>) {
+      // W-57 batch 1: output records as ONE batched arena allocation + ONE
+      // nochain span (bit-identical values/adjoints; see WORKLOG W-57).
+      // The arena double temp below is required because Eigen forbids coeff
+      // access on Product expressions and is probe-verified bitwise-equal to
+      // stock's implicitly-evaluated temp.
+      arena_t<plain_type_t<decltype(arena_A_val * arena_B_val)>> res_val
+          = arena_A_val * arena_B_val;
+      arena_t<return_t> res(res_val.rows(), res_val.cols());
+      make_nochain_vari_array(res_val, res.data());
 
-    reverse_pass_callback(
-        [arena_A, arena_B, arena_A_val, arena_B_val, res]() mutable {
-          if constexpr (is_var_matrix<T1>::value || is_var_matrix<T2>::value) {
-            arena_A.adj() += res.adj_op() * arena_B_val.transpose();
-            arena_B.adj() += arena_A_val.transpose() * res.adj_op();
-          } else {
-            auto res_adj = res.adj().eval();
-            arena_A.adj() += res_adj * arena_B_val.transpose();
-            arena_B.adj() += arena_A_val.transpose() * res_adj;
-          }
-        });
-    return res;
+      reverse_pass_callback(
+          [arena_A, arena_B, arena_A_val, arena_B_val, res]() mutable {
+            if constexpr (is_var_matrix<T1>::value
+                              || is_var_matrix<T2>::value) {
+              arena_A.adj() += res.adj_op() * arena_B_val.transpose();
+              arena_B.adj() += arena_A_val.transpose() * res.adj_op();
+            } else {
+              auto res_adj = res.adj().eval();
+              arena_A.adj() += res_adj * arena_B_val.transpose();
+              arena_B.adj() += arena_A_val.transpose() * res_adj;
+            }
+          });
+      return res;
+    } else {
+      arena_t<return_t> res = arena_A_val * arena_B_val;
+
+      reverse_pass_callback(
+          [arena_A, arena_B, arena_A_val, arena_B_val, res]() mutable {
+            if constexpr (is_var_matrix<T1>::value
+                          || is_var_matrix<T2>::value) {
+              arena_A.adj() += res.adj_op() * arena_B_val.transpose();
+              arena_B.adj() += arena_A_val.transpose() * res.adj_op();
+            } else {
+              auto res_adj = res.adj().eval();
+              arena_A.adj() += res_adj * arena_B_val.transpose();
+              arena_B.adj() += arena_A_val.transpose() * res_adj;
+            }
+          });
+      return res;
+    }
   } else if constexpr (is_autodiff_v<T2>) {
     arena_t<promote_scalar_t<double, T1>> arena_A = value_of(A);
     arena_t<promote_scalar_t<var, T2>> arena_B(std::forward<T2>(B));
     using return_t
         = return_var_matrix_t<decltype(arena_A * value_of(B).eval()), T1, T2>;
-    arena_t<return_t> res = arena_A * arena_B.val();
-    reverse_pass_callback([arena_B, arena_A, res]() mutable {
-      arena_B.adj() += arena_A.transpose() * res.adj_op();
-    });
-    return res;
+    if constexpr (is_eigen_v<return_t>) {
+      // W-58 batch 2: output records as ONE batched arena allocation + ONE
+      // nochain span (bit-identical values/adjoints; see WORKLOG W-58).
+      // The arena double temp below is required because Eigen forbids coeff
+      // access on Product expressions and is probe-verified bitwise-equal to
+      // stock's implicitly-evaluated temp.
+      arena_t<plain_type_t<decltype(arena_A * arena_B.val())>> res_val
+          = arena_A * arena_B.val();
+      arena_t<return_t> res(res_val.rows(), res_val.cols());
+      make_nochain_vari_array(res_val, res.data());
+      reverse_pass_callback([arena_B, arena_A, res]() mutable {
+        arena_B.adj() += arena_A.transpose() * res.adj_op();
+      });
+      return res;
+    } else {
+      arena_t<return_t> res = arena_A * arena_B.val();
+      reverse_pass_callback([arena_B, arena_A, res]() mutable {
+        arena_B.adj() += arena_A.transpose() * res.adj_op();
+      });
+      return res;
+    }
   } else {
     arena_t<promote_scalar_t<var, T1>> arena_A(std::forward<T1>(A));
     arena_t<promote_scalar_t<double, T2>> arena_B = value_of(B);
     using return_t
         = return_var_matrix_t<decltype(value_of(arena_A).eval() * arena_B), T1,
                               T2>;
-    arena_t<return_t> res = arena_A.val() * arena_B;
-    reverse_pass_callback([arena_A, arena_B, res]() mutable {
-      arena_A.adj() += res.adj_op() * arena_B.transpose();
-    });
+    if constexpr (is_eigen_v<return_t>) {
+      // W-58 batch 2: output records as ONE batched arena allocation + ONE
+      // nochain span (bit-identical values/adjoints; see WORKLOG W-58).
+      // The arena double temp below is required because Eigen forbids coeff
+      // access on Product expressions and is probe-verified bitwise-equal to
+      // stock's implicitly-evaluated temp.
+      arena_t<plain_type_t<decltype(arena_A.val() * arena_B)>> res_val
+          = arena_A.val() * arena_B;
+      arena_t<return_t> res(res_val.rows(), res_val.cols());
+      make_nochain_vari_array(res_val, res.data());
+      reverse_pass_callback([arena_A, arena_B, res]() mutable {
+        arena_A.adj() += res.adj_op() * arena_B.transpose();
+      });
 
-    return res;
+      return res;
+    } else {
+      arena_t<return_t> res = arena_A.val() * arena_B;
+      reverse_pass_callback([arena_A, arena_B, res]() mutable {
+        arena_A.adj() += res.adj_op() * arena_B.transpose();
+      });
+
+      return res;
+    }
   }
 }
 
@@ -143,35 +204,77 @@ inline auto multiply(const T1& a, T2&& B) {
     using return_t = return_var_matrix_t<T2, T1, T2>;
     var av = a;
     auto a_val = value_of(av);
-    arena_t<return_t> res = a_val * arena_B.val().array();
-    reverse_pass_callback([av, a_val, arena_B, res]() mutable {
-      for (Eigen::Index j = 0; j < res.cols(); ++j) {
-        for (Eigen::Index i = 0; i < res.rows(); ++i) {
-          const auto res_adj = res.adj().coeffRef(i, j);
-          av.adj() += res_adj * arena_B.val().coeff(i, j);
-          arena_B.adj().coeffRef(i, j) += a_val * res_adj;
+    if constexpr (is_eigen_v<return_t>) {
+      // W-57 batch 1: output records as ONE batched arena allocation + ONE
+      // nochain span (bit-identical values/adjoints; see WORKLOG W-57).
+      auto prod_expr = a_val * arena_B.val().array();
+      arena_t<return_t> res(prod_expr.rows(), prod_expr.cols());
+      make_nochain_vari_array(prod_expr, res.data());
+      reverse_pass_callback([av, a_val, arena_B, res]() mutable {
+        for (Eigen::Index j = 0; j < res.cols(); ++j) {
+          for (Eigen::Index i = 0; i < res.rows(); ++i) {
+            const auto res_adj = res.adj().coeffRef(i, j);
+            av.adj() += res_adj * arena_B.val().coeff(i, j);
+            arena_B.adj().coeffRef(i, j) += a_val * res_adj;
+          }
         }
-      }
-    });
-    return res;
+      });
+      return res;
+    } else {
+      arena_t<return_t> res = a_val * arena_B.val().array();
+      reverse_pass_callback([av, a_val, arena_B, res]() mutable {
+        for (Eigen::Index j = 0; j < res.cols(); ++j) {
+          for (Eigen::Index i = 0; i < res.rows(); ++i) {
+            const auto res_adj = res.adj().coeffRef(i, j);
+            av.adj() += res_adj * arena_B.val().coeff(i, j);
+            arena_B.adj().coeffRef(i, j) += a_val * res_adj;
+          }
+        }
+      });
+      return res;
+    }
   } else if constexpr (is_autodiff_v<T2>) {
     double val_a = value_of(a);
     arena_t<promote_scalar_t<var, T2>> arena_B(std::forward<T2>(B));
     using return_t = return_var_matrix_t<T2, T1, T2>;
-    arena_t<return_t> res = val_a * arena_B.val().array();
-    reverse_pass_callback([val_a, arena_B, res]() mutable {
-      arena_B.adj().array() += val_a * res.adj().array();
-    });
-    return res;
+    if constexpr (is_eigen_v<return_t>) {
+      // W-58 batch 2: output records as ONE batched arena allocation + ONE
+      // nochain span (bit-identical values/adjoints; see WORKLOG W-58).
+      auto prod_expr = val_a * arena_B.val().array();
+      arena_t<return_t> res(prod_expr.rows(), prod_expr.cols());
+      make_nochain_vari_array(prod_expr, res.data());
+      reverse_pass_callback([val_a, arena_B, res]() mutable {
+        arena_B.adj().array() += val_a * res.adj().array();
+      });
+      return res;
+    } else {
+      arena_t<return_t> res = val_a * arena_B.val().array();
+      reverse_pass_callback([val_a, arena_B, res]() mutable {
+        arena_B.adj().array() += val_a * res.adj().array();
+      });
+      return res;
+    }
   } else {
     var av = a;
     arena_t<promote_scalar_t<double, T2>> arena_B = value_of(B);
     using return_t = return_var_matrix_t<T2, T1, T2>;
-    arena_t<return_t> res = av.val() * arena_B.array();
-    reverse_pass_callback([av, arena_B, res]() mutable {
-      av.adj() += (res.adj().array() * arena_B.array()).sum();
-    });
-    return res;
+    if constexpr (is_eigen_v<return_t>) {
+      // W-58 batch 2: output records as ONE batched arena allocation + ONE
+      // nochain span (bit-identical values/adjoints; see WORKLOG W-58).
+      auto prod_expr = av.val() * arena_B.array();
+      arena_t<return_t> res(prod_expr.rows(), prod_expr.cols());
+      make_nochain_vari_array(prod_expr, res.data());
+      reverse_pass_callback([av, arena_B, res]() mutable {
+        av.adj() += (res.adj().array() * arena_B.array()).sum();
+      });
+      return res;
+    } else {
+      arena_t<return_t> res = av.val() * arena_B.array();
+      reverse_pass_callback([av, arena_B, res]() mutable {
+        av.adj() += (res.adj().array() * arena_B.array()).sum();
+      });
+      return res;
+    }
   }
 }
 

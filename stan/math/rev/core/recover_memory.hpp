@@ -23,6 +23,11 @@ static inline void recover_memory() {
   }
   ChainableStack::instance_->var_stack_.clear();
   ChainableStack::instance_->var_nochain_stack_.clear();
+  // W-53 research slice: span registry cleared with the per-vari
+  // nochain stack; the records live in the arena freed by
+  // recover_all().
+  ChainableStack::instance_->var_nochain_spans_.clear();
+  ChainableStack::instance_->nochain_span_records_ = 0;
   for (auto &x : ChainableStack::instance_->var_alloc_stack_) {
     delete x;
   }

@@ -56,7 +56,8 @@ class profile_info {
     if constexpr (is_autodiff_v<T>) {
       start_chain_stack_size_ = ChainableStack::instance_->var_stack_.size();
       start_nochain_stack_size_
-          = ChainableStack::instance_->var_nochain_stack_.size();
+          = ChainableStack::instance_->var_nochain_stack_.size()
+            + ChainableStack::instance_->nochain_span_records_;
     }
     fwd_pass_tp_ = std::chrono::steady_clock::now();
     active_ = true;
@@ -68,8 +69,12 @@ class profile_info {
       n_fwd_AD_passes_++;
       chain_stack_size_sum_ += (ChainableStack::instance_->var_stack_.size()
                                 - start_chain_stack_size_ - 1);
+      // W-53 research slice: nochain accounting covers per-vari
+      // registrations plus batch-span records so profile reports keep
+      // counting every record.
       nochain_stack_size_sum_
           += (ChainableStack::instance_->var_nochain_stack_.size()
+              + ChainableStack::instance_->nochain_span_records_
               - start_nochain_stack_size_);
     } else {
       n_fwd_no_AD_passes_++;

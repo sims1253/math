@@ -3,6 +3,7 @@
 
 #include <stan/math/prim/fun/Eigen.hpp>
 #include <stan/math/rev/core.hpp>
+#include <stan/math/rev/core/make_nochain_vari_array.hpp>
 #include <stan/math/rev/fun/multiply.hpp>
 #include <stan/math/prim/meta.hpp>
 #include <stan/math/prim/err.hpp>
@@ -33,33 +34,87 @@ inline auto elt_multiply(const Mat1& m1, const Mat2& m2) {
   if constexpr (is_autodiff_v<Mat1> && is_autodiff_v<Mat2>) {
     arena_t<promote_scalar_t<var, Mat1>> arena_m1 = m1;
     arena_t<promote_scalar_t<var, Mat2>> arena_m2 = m2;
-    arena_t<ret_type> ret(arena_m1.val().cwiseProduct(arena_m2.val()));
-    reverse_pass_callback([ret, arena_m1, arena_m2]() mutable {
-      for (Eigen::Index j = 0; j < arena_m2.cols(); ++j) {
-        for (Eigen::Index i = 0; i < arena_m2.rows(); ++i) {
-          const auto ret_adj = ret.adj().coeffRef(i, j);
-          arena_m1.adj().coeffRef(i, j) += arena_m2.val().coeff(i, j) * ret_adj;
-          arena_m2.adj().coeffRef(i, j) += arena_m1.val().coeff(i, j) * ret_adj;
+    if constexpr (is_eigen_v<ret_type>) {
+      // W-53 research slice: for the Matrix<var> return shape (the
+      // per-element-record path taken whenever an operand is a plain
+      // Eigen expression rather than a var<Matrix>), construct the
+      // output records as ONE batched arena allocation + ONE nochain
+      // span instead of per-element var(double) arena allocations and
+      // var_nochain_stack_ pushes. Values are the same per-element
+      // products of the same doubles in the same positions; adjoints
+      // start at 0.0 exactly as stock; the reverse pass below is
+      // unchanged and addresses the records through the same
+      // Matrix<var> pointer array.
+      auto prod_expr = arena_m1.val().cwiseProduct(arena_m2.val());
+      arena_t<ret_type> ret(arena_m1.rows(), arena_m1.cols());
+      make_nochain_vari_array(prod_expr, ret.data());
+      reverse_pass_callback([ret, arena_m1, arena_m2]() mutable {
+        for (Eigen::Index j = 0; j < arena_m2.cols(); ++j) {
+          for (Eigen::Index i = 0; i < arena_m2.rows(); ++i) {
+            const auto ret_adj = ret.adj().coeffRef(i, j);
+            arena_m1.adj().coeffRef(i, j)
+                += arena_m2.val().coeff(i, j) * ret_adj;
+            arena_m2.adj().coeffRef(i, j)
+                += arena_m1.val().coeff(i, j) * ret_adj;
+          }
         }
-      }
-    });
-    return ret_type(ret);
+      });
+      return ret_type(ret);
+    } else {
+      arena_t<ret_type> ret(arena_m1.val().cwiseProduct(arena_m2.val()));
+      reverse_pass_callback([ret, arena_m1, arena_m2]() mutable {
+        for (Eigen::Index j = 0; j < arena_m2.cols(); ++j) {
+          for (Eigen::Index i = 0; i < arena_m2.rows(); ++i) {
+            const auto ret_adj = ret.adj().coeffRef(i, j);
+            arena_m1.adj().coeffRef(i, j)
+                += arena_m2.val().coeff(i, j) * ret_adj;
+            arena_m2.adj().coeffRef(i, j)
+                += arena_m1.val().coeff(i, j) * ret_adj;
+          }
+        }
+      });
+      return ret_type(ret);
+    }
   } else if constexpr (is_autodiff_v<Mat1>) {
     arena_t<promote_scalar_t<var, Mat1>> arena_m1 = m1;
     arena_t<promote_scalar_t<double, Mat2>> arena_m2 = value_of(m2);
-    arena_t<ret_type> ret(arena_m1.val().cwiseProduct(arena_m2));
-    reverse_pass_callback([ret, arena_m1, arena_m2]() mutable {
-      arena_m1.adj().array() += arena_m2.array() * ret.adj().array();
-    });
-    return ret_type(ret);
+    if constexpr (is_eigen_v<ret_type>) {
+      // W-58 batch 2: output records as ONE batched arena allocation + ONE
+      // nochain span (bit-identical values/adjoints; see WORKLOG W-58).
+      auto prod_expr = arena_m1.val().cwiseProduct(arena_m2);
+      arena_t<ret_type> ret(prod_expr.rows(), prod_expr.cols());
+      make_nochain_vari_array(prod_expr, ret.data());
+      reverse_pass_callback([ret, arena_m1, arena_m2]() mutable {
+        arena_m1.adj().array() += arena_m2.array() * ret.adj().array();
+      });
+      return ret_type(ret);
+    } else {
+      arena_t<ret_type> ret(arena_m1.val().cwiseProduct(arena_m2));
+      reverse_pass_callback([ret, arena_m1, arena_m2]() mutable {
+        arena_m1.adj().array() += arena_m2.array() * ret.adj().array();
+      });
+      return ret_type(ret);
+    }
   } else if constexpr (is_autodiff_v<Mat2>) {
     arena_t<promote_scalar_t<double, Mat1>> arena_m1 = value_of(m1);
     arena_t<promote_scalar_t<var, Mat2>> arena_m2 = m2;
-    arena_t<ret_type> ret(arena_m1.cwiseProduct(arena_m2.val()));
-    reverse_pass_callback([ret, arena_m2, arena_m1]() mutable {
-      arena_m2.adj().array() += arena_m1.array() * ret.adj().array();
-    });
-    return ret_type(ret);
+    if constexpr (is_eigen_v<ret_type>) {
+      // W-58 batch 2: output records as ONE batched arena allocation + ONE
+      // nochain span (bit-identical values/adjoints; see WORKLOG W-58).
+      auto prod_expr = arena_m1.cwiseProduct(arena_m2.val());
+      arena_t<ret_type> ret(prod_expr.rows(), prod_expr.cols());
+      make_nochain_vari_array(prod_expr, ret.data());
+      reverse_pass_callback([ret, arena_m2, arena_m1]() mutable {
+        arena_m2.adj().array() += arena_m1.array() * ret.adj().array();
+      });
+      return ret_type(ret);
+    } else {
+      arena_t<ret_type> ret(arena_m1.cwiseProduct(arena_m2.val()));
+      reverse_pass_callback([ret, arena_m2, arena_m1]() mutable {
+        arena_m2.adj().array() += arena_m1.array() * ret.adj().array();
+      });
+      return ret_type(ret);
+    }
   }
 }
 

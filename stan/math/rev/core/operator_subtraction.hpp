@@ -5,6 +5,7 @@
 #include <stan/math/rev/core/var.hpp>
 #include <stan/math/rev/core/arena_matrix.hpp>
 #include <stan/math/rev/core/callback_vari.hpp>
+#include <stan/math/rev/core/make_nochain_vari_array.hpp>
 #include <stan/math/prim/fun/as_column_vector_or_scalar.hpp>
 #include <stan/math/prim/fun/as_array_or_scalar.hpp>
 #include <stan/math/prim/fun/constants.hpp>
@@ -121,17 +122,35 @@ inline auto subtract(const VarMat1& a, const VarMat2& b) {
   using ret_type = return_var_matrix_t<op_ret_type, VarMat1, VarMat2>;
   arena_t<VarMat1> arena_a = a;
   arena_t<VarMat2> arena_b = b;
-  arena_t<ret_type> ret((arena_a.val() - arena_b.val()));
-  reverse_pass_callback([ret, arena_a, arena_b]() mutable {
-    for (Eigen::Index j = 0; j < ret.cols(); ++j) {
-      for (Eigen::Index i = 0; i < ret.rows(); ++i) {
-        const auto ref_adj = ret.adj().coeffRef(i, j);
-        arena_a.adj().coeffRef(i, j) += ref_adj;
-        arena_b.adj().coeffRef(i, j) -= ref_adj;
+  if constexpr (is_eigen_v<ret_type>) {
+    // W-57 batch 1: output records as ONE batched arena allocation + ONE
+    // nochain span (bit-identical values/adjoints; see WORKLOG W-57).
+    auto diff_expr = arena_a.val() - arena_b.val();
+    arena_t<ret_type> ret(diff_expr.rows(), diff_expr.cols());
+    make_nochain_vari_array(diff_expr, ret.data());
+    reverse_pass_callback([ret, arena_a, arena_b]() mutable {
+      for (Eigen::Index j = 0; j < ret.cols(); ++j) {
+        for (Eigen::Index i = 0; i < ret.rows(); ++i) {
+          const auto ref_adj = ret.adj().coeffRef(i, j);
+          arena_a.adj().coeffRef(i, j) += ref_adj;
+          arena_b.adj().coeffRef(i, j) -= ref_adj;
+        }
       }
-    }
-  });
-  return ret_type(ret);
+    });
+    return ret_type(ret);
+  } else {
+    arena_t<ret_type> ret((arena_a.val() - arena_b.val()));
+    reverse_pass_callback([ret, arena_a, arena_b]() mutable {
+      for (Eigen::Index j = 0; j < ret.cols(); ++j) {
+        for (Eigen::Index i = 0; i < ret.rows(); ++i) {
+          const auto ref_adj = ret.adj().coeffRef(i, j);
+          arena_a.adj().coeffRef(i, j) += ref_adj;
+          arena_b.adj().coeffRef(i, j) -= ref_adj;
+        }
+      }
+    });
+    return ret_type(ret);
+  }
 }
 
 /**
@@ -154,10 +173,21 @@ inline auto subtract(const VarMat& a, const Arith& b) {
       (a.val().array() - as_array_or_scalar(b)).matrix())>;
   using ret_type = return_var_matrix_t<op_ret_type, VarMat>;
   arena_t<VarMat> arena_a = a;
-  arena_t<ret_type> ret(arena_a.val().array() - as_array_or_scalar(b));
-  reverse_pass_callback(
-      [ret, arena_a]() mutable { arena_a.adj() += ret.adj(); });
-  return ret_type(ret);
+  if constexpr (is_eigen_v<ret_type>) {
+    // W-58 batch 2: output records as ONE batched arena allocation + ONE
+    // nochain span (bit-identical values/adjoints; see WORKLOG W-58).
+    auto diff_expr = arena_a.val().array() - as_array_or_scalar(b);
+    arena_t<ret_type> ret(diff_expr.rows(), diff_expr.cols());
+    make_nochain_vari_array(diff_expr, ret.data());
+    reverse_pass_callback(
+        [ret, arena_a]() mutable { arena_a.adj() += ret.adj(); });
+    return ret_type(ret);
+  } else {
+    arena_t<ret_type> ret(arena_a.val().array() - as_array_or_scalar(b));
+    reverse_pass_callback(
+        [ret, arena_a]() mutable { arena_a.adj() += ret.adj(); });
+    return ret_type(ret);
+  }
 }
 
 /**
@@ -180,10 +210,21 @@ inline auto subtract(const Arith& a, const VarMat& b) {
       (as_array_or_scalar(a) - b.val().array()).matrix())>;
   using ret_type = return_var_matrix_t<op_ret_type, VarMat>;
   arena_t<VarMat> arena_b = b;
-  arena_t<ret_type> ret(as_array_or_scalar(a) - arena_b.val().array());
-  reverse_pass_callback(
-      [ret, arena_b]() mutable { arena_b.adj() -= ret.adj_op(); });
-  return ret_type(ret);
+  if constexpr (is_eigen_v<ret_type>) {
+    // W-58 batch 2: output records as ONE batched arena allocation + ONE
+    // nochain span (bit-identical values/adjoints; see WORKLOG W-58).
+    auto diff_expr = as_array_or_scalar(a) - arena_b.val().array();
+    arena_t<ret_type> ret(diff_expr.rows(), diff_expr.cols());
+    make_nochain_vari_array(diff_expr, ret.data());
+    reverse_pass_callback(
+        [ret, arena_b]() mutable { arena_b.adj() -= ret.adj_op(); });
+    return ret_type(ret);
+  } else {
+    arena_t<ret_type> ret(as_array_or_scalar(a) - arena_b.val().array());
+    reverse_pass_callback(
+        [ret, arena_b]() mutable { arena_b.adj() -= ret.adj_op(); });
+    return ret_type(ret);
+  }
 }
 
 /**
@@ -200,9 +241,19 @@ template <typename Var, typename EigMat,
           require_eigen_vt<std::is_arithmetic, EigMat>* = nullptr>
 inline auto subtract(const Var& a, const EigMat& b) {
   using ret_type = return_var_matrix_t<EigMat>;
-  arena_t<ret_type> ret(a.val() - b.array());
-  reverse_pass_callback([ret, a]() mutable { a.adj() += ret.adj().sum(); });
-  return ret_type(ret);
+  if constexpr (is_eigen_v<ret_type>) {
+    // W-58 batch 2: output records as ONE batched arena allocation + ONE
+    // nochain span (bit-identical values/adjoints; see WORKLOG W-58).
+    auto diff_expr = a.val() - b.array();
+    arena_t<ret_type> ret(diff_expr.rows(), diff_expr.cols());
+    make_nochain_vari_array(diff_expr, ret.data());
+    reverse_pass_callback([ret, a]() mutable { a.adj() += ret.adj().sum(); });
+    return ret_type(ret);
+  } else {
+    arena_t<ret_type> ret(a.val() - b.array());
+    reverse_pass_callback([ret, a]() mutable { a.adj() += ret.adj().sum(); });
+    return ret_type(ret);
+  }
 }
 
 /**
@@ -219,9 +270,19 @@ template <typename EigMat, typename Var,
           require_var_vt<std::is_arithmetic, Var>* = nullptr>
 inline auto subtract(const EigMat& a, const Var& b) {
   using ret_type = return_var_matrix_t<EigMat>;
-  arena_t<ret_type> ret(a.array() - b.val());
-  reverse_pass_callback([ret, b]() mutable { b.adj() -= ret.adj().sum(); });
-  return ret_type(ret);
+  if constexpr (is_eigen_v<ret_type>) {
+    // W-58 batch 2: output records as ONE batched arena allocation + ONE
+    // nochain span (bit-identical values/adjoints; see WORKLOG W-58).
+    auto diff_expr = a.array() - b.val();
+    arena_t<ret_type> ret(diff_expr.rows(), diff_expr.cols());
+    make_nochain_vari_array(diff_expr, ret.data());
+    reverse_pass_callback([ret, b]() mutable { b.adj() -= ret.adj().sum(); });
+    return ret_type(ret);
+  } else {
+    arena_t<ret_type> ret(a.array() - b.val());
+    reverse_pass_callback([ret, b]() mutable { b.adj() -= ret.adj().sum(); });
+    return ret_type(ret);
+  }
 }
 
 /**
@@ -240,17 +301,35 @@ template <typename Var, typename VarMat,
 inline auto subtract(const Var& a, const VarMat& b) {
   using ret_type = return_var_matrix_t<VarMat>;
   arena_t<VarMat> arena_b(b);
-  arena_t<ret_type> ret(a.val() - arena_b.val().array());
-  reverse_pass_callback([ret, a, arena_b]() mutable {
-    for (Eigen::Index j = 0; j < ret.cols(); ++j) {
-      for (Eigen::Index i = 0; i < ret.rows(); ++i) {
-        auto ret_adj = ret.adj().coeff(i, j);
-        a.adj() += ret_adj;
-        arena_b.adj().coeffRef(i, j) -= ret_adj;
+  if constexpr (is_eigen_v<ret_type>) {
+    // W-58 batch 2: output records as ONE batched arena allocation + ONE
+    // nochain span (bit-identical values/adjoints; see WORKLOG W-58).
+    auto diff_expr = a.val() - arena_b.val().array();
+    arena_t<ret_type> ret(diff_expr.rows(), diff_expr.cols());
+    make_nochain_vari_array(diff_expr, ret.data());
+    reverse_pass_callback([ret, a, arena_b]() mutable {
+      for (Eigen::Index j = 0; j < ret.cols(); ++j) {
+        for (Eigen::Index i = 0; i < ret.rows(); ++i) {
+          auto ret_adj = ret.adj().coeff(i, j);
+          a.adj() += ret_adj;
+          arena_b.adj().coeffRef(i, j) -= ret_adj;
+        }
       }
-    }
-  });
-  return ret_type(ret);
+    });
+    return ret_type(ret);
+  } else {
+    arena_t<ret_type> ret(a.val() - arena_b.val().array());
+    reverse_pass_callback([ret, a, arena_b]() mutable {
+      for (Eigen::Index j = 0; j < ret.cols(); ++j) {
+        for (Eigen::Index i = 0; i < ret.rows(); ++i) {
+          auto ret_adj = ret.adj().coeff(i, j);
+          a.adj() += ret_adj;
+          arena_b.adj().coeffRef(i, j) -= ret_adj;
+        }
+      }
+    });
+    return ret_type(ret);
+  }
 }
 
 /**
@@ -269,17 +348,35 @@ template <typename Var, typename VarMat,
 inline auto subtract(const VarMat& a, const Var& b) {
   using ret_type = return_var_matrix_t<VarMat>;
   arena_t<VarMat> arena_a(a);
-  arena_t<ret_type> ret(arena_a.val().array() - b.val());
-  reverse_pass_callback([ret, b, arena_a]() mutable {
-    for (Eigen::Index j = 0; j < ret.cols(); ++j) {
-      for (Eigen::Index i = 0; i < ret.rows(); ++i) {
-        const auto ret_adj = ret.adj().coeff(i, j);
-        arena_a.adj().coeffRef(i, j) += ret_adj;
-        b.adj() -= ret_adj;
+  if constexpr (is_eigen_v<ret_type>) {
+    // W-58 batch 2: output records as ONE batched arena allocation + ONE
+    // nochain span (bit-identical values/adjoints; see WORKLOG W-58).
+    auto diff_expr = arena_a.val().array() - b.val();
+    arena_t<ret_type> ret(diff_expr.rows(), diff_expr.cols());
+    make_nochain_vari_array(diff_expr, ret.data());
+    reverse_pass_callback([ret, b, arena_a]() mutable {
+      for (Eigen::Index j = 0; j < ret.cols(); ++j) {
+        for (Eigen::Index i = 0; i < ret.rows(); ++i) {
+          const auto ret_adj = ret.adj().coeff(i, j);
+          arena_a.adj().coeffRef(i, j) += ret_adj;
+          b.adj() -= ret_adj;
+        }
       }
-    }
-  });
-  return ret_type(ret);
+    });
+    return ret_type(ret);
+  } else {
+    arena_t<ret_type> ret(arena_a.val().array() - b.val());
+    reverse_pass_callback([ret, b, arena_a]() mutable {
+      for (Eigen::Index j = 0; j < ret.cols(); ++j) {
+        for (Eigen::Index i = 0; i < ret.rows(); ++i) {
+          const auto ret_adj = ret.adj().coeff(i, j);
+          arena_a.adj().coeffRef(i, j) += ret_adj;
+          b.adj() -= ret_adj;
+        }
+      }
+    });
+    return ret_type(ret);
+  }
 }
 
 template <typename T1, typename T2,
